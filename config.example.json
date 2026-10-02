@@ -1,0 +1,36 @@
+{
+  "//": "Copy to config.json and edit. config.json is gitignored: it holds your real model ids, absolute paths, and is read fresh on every settle.",
+  "defaults": {
+    "enabled": false,
+    "autoConfirm": false,
+    "judgeModel": "<provider>/<judge-model>",
+    "judgeThinking": "low",
+    "judgeTimeoutMs": 120000,
+    "bootstrapTimeoutMs": 300000,
+    "maxIterations": 300,
+    "maxJudgeFailures": 2,
+    "smartCompaction": true,
+    "enforceReadTools": false,
+    "escalationAgent": "escalation",
+    "judgeFailover": true,
+    "judgeFailoverModel": "<provider>/<fallback-model>",
+    "stopFile": "~/.pi/agent/extensions/pi-supervisor/STOP",
+    "logFile": "verdicts.jsonl",
+    "quotaWait": {
+      "enabled": true,
+      "intervalMs": 600000,
+      "maxWaitMinutes": 0,
+      "maxAttempts": 0,
+      "permanentAsHumanNeeded": true,
+      "extraPatterns": [],
+      "ignorePatterns": []
+    }
+  },
+  "projects": {
+    "/abs/path/to/a/dedicated/unattended/worktree": {
+      "enabled": true,
+      "autoConfirm": true,
+      "//": "Per-project keys override defaults shallowly. Only list what you want to change; enabled:true here means EVERY session under this path auto-arms, so reserve it for single-purpose unattended worktrees."
+    }
+  }
+}

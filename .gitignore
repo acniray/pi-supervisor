@@ -1,0 +1,12 @@
+# Machine-local runtime files — never commit these.
+# `config.json` holds your real judge models and absolute project paths.
+# `verdicts.jsonl` holds every judge verdict, contract and error text from your sessions.
+config.json
+verdicts.jsonl
+
+# Soft-stop switch (touch this file to make the supervisor yield)
+STOP
+
+*.log
+node_modules/
+.DS_Store
