@@ -1,294 +1,224 @@
 # pi-supervisor
 
-无人值守长任务的 **stop 监督者**。不需要为每个任务维护目标文件：它自己从**当前会话 + 仓库**
-推断任务契约，在对话框里给你**可编辑的确认界面**（可以直接补充/修改意见），确认后**立刻继续执行**；
-之后每次模型停止（settle）时用**另一个大模型**按契约判定：继续 / 放行 / 需要人类。
+让长任务停在**用户认可的终点**，而不是停在主 Agent 的一句“完成了”。
+
+Supervisor 从当前会话推断一份短契约：**目标、完成条件、必要限制**。确认后，每次主 Agent 停止时，独立判官核验完成证据：未闭环就给出下一步，证据齐全就结束监督，需要你处理时则暂停。
+
+不需要维护额外目标文件。契约和监督状态保存在当前会话中，不修改项目代码。
 
 ## 安装
-
-pi 会从 `~/.pi/agent/extensions/<name>/index.ts` 加载扩展，所以直接克隆到那里即可：
 
 ```bash
 git clone https://github.com/acniray/pi-supervisor ~/.pi/agent/extensions/pi-supervisor
 cd ~/.pi/agent/extensions/pi-supervisor
 cp config.example.json config.json
-$EDITOR config.json          # 至少填 judgeModel / judgeFailoverModel
+$EDITOR config.json  # 填写自己的 judgeModel / judgeFailoverModel
 ```
 
-无第三方依赖、无需构建 —— pi 直接加载 TypeScript。跑单测只需要 Node ≥ 22.6（自带类型剥离）：
+无第三方依赖、无需构建，pi 直接加载 `index.ts`。测试需要 Node ≥ 22.6：
 
 ```bash
-node --test quota.test.ts
+node --test *.test.ts
 ```
 
-`config.json` 与 `verdicts.jsonl` 都在 `.gitignore` 里：前者是你本机的真实配置（模型 id、绝对路径），
-后者是判官每次判定/契约/错误文本的审计日志，都不应该进版本库。
+`config.json` 和 `verdicts.jsonl` 已被 gitignore：前者含本机配置，后者含任务契约、判定及错误文本，不应提交或公开。
 
-装好后**任何会话都不会自动启用**：按会话 `/supervisor start`，或无人值守启动时用 `pi --supervise`。
+> `DEFAULTS` 中的模型与 agent 名称是作者本机取值，不保证在你的环境可用。请在 `config.json` 中覆盖。
 
-> 代码里的 `DEFAULTS`（`judgeModel` / `judgeFailoverModel` / `escalationAgent`）是作者本机的取值，
-> 只作为兜底；请一律在自己的 `config.json` 里覆盖成你的模型与决策子 agent 名称。
+## 先记住这五个命令
 
-## 两阶段
+| 命令 | 作用 |
+|---|---|
+| `/supervisor start` | 推断并确认终点，建立新的监督任务；已经监督中时不重复启动 |
+| `/supervisor pause` | 暂停 Supervisor，保留已确认的契约与监督进度 |
+| `/supervisor resume` | 恢复暂停任务；空闲的 TUI/RPC 会话会立即续跑 |
+| `/supervisor cancel` | **额外确认后**移除有效契约、放弃本次监督进度 |
+| `/supervisor status` | 查看当前状态、终点、未闭环项及下一步；不带参数也可 |
 
+**暂停和取消都只作用于 Supervisor，不打断正在运行的主 Agent。** 取消不回滚代码或提交，不删除对话与审计历史；要停止主 Agent，请使用 pi 自身的停止操作。
+
+取消确认默认选中“不取消”；Esc、关闭确认框或无法显示交互界面都不会取消。取消后只能用 `start` 建立新任务，不能用 `resume` 恢复旧进度。
+
+旧命令 `on/off/reset` 已弃用：只提示迁移，不改变状态。请分别使用明确的 `start/pause/resume/cancel`。
+
+### 状态含义
+
+- **未启用**：没有有效监督任务。
+- **待确认**：正在推断或确认候选终点，尚未按新契约监督。
+- **监督中**：按已确认契约核验、续跑。
+- **已暂停**：保留原任务，等待 `resume`；需要人类处理、STOP 文件或达到上限也会进入这里。
+- **已取消**：当前契约和监督进度已清除，历史仍可查。
+- **已完成**：完成条件已有对应证据，监督结束；不会因下一条输入自动重启。
+
+终端状态栏持续显示主状态；模型、费用、日志等诊断信息放在二级命令里。
+
+## 确认终点，再开始监督
+
+```text
+/supervisor start
+  → 根据当前会话推断目标、完成条件、必要限制
+  → 编辑框确认；有修改意见则重新推断（最多 3 轮）
+  → 确认后进入监督，空闲时立即推进下一步
+
+主 Agent 停止
+  → 判官逐项核验完成条件
+     ├─ 证据不足：简短列出未闭环项 + 下一步，继续
+     ├─ 条件均有证据：已完成
+     ├─ 需要人类：已暂停，处理后 resume
+     └─ 目标或限制变化：已暂停，replan 重新确认
 ```
-首次 settle 或 /supervisor start|replan
-   └─ BOOTSTRAP：判官以当前 session（用户请求/最近对话/主 Agent 汇报）为主要依据推断契约；
-        仅在 session 提到文件/需验证关键事实时用只读工具少量取证（不默认扫描仓库）
-        → 推断契约 → 打开编辑框（契约正文 + 「修改意见」区）
-           ├─ 有修改意见 → 带意见重新推断（最多 3 轮）
-           └─ 直接提交   → 确认 → 立即用 next_steps[0] 续跑任务（不再多调一次判官）
-之后每次 settle
-   └─ ENFORCE：判官按契约判定
-        ├─ 未达成 → 注入 next_step + 需补齐的决策/记录项，继续
-        ├─ 已达成 → 放行
-        ├─ 需要人类 → 放行并提示
-        └─ compact_now → 压缩后自动续跑（TUI/RPC）
+
+编辑框默认只展示终点，不展示整套流程说明：
+
+- 保持正文不变，在“修改意见”区留空提交：确认。
+- 修改正文，或在“修改意见”区写要求：重新推断，不直接执行编辑后的文字。
+- Esc：放弃候选。首次启动仍未启用；重新规划则保留旧契约与原状态。
+
+缺少明确目标/完成条件、有待澄清问题时，不会启用；低置信度候选必须人工确认。推断失败也不会生成一份通用契约自动续跑。
+
+契约包含 `mission`、`completion_criteria`、`boundaries`；完整详情保留进度、后续步骤、用户说明及已有决策/记录/停止规则。普通判定只能更新进度和步骤，不能悄悄改掉已确认的目标、条件或限制。
+
+### 补充说明与重新规划
+
+```text
+/supervisor replan           # 为现有任务重新推断终点，确认前不替换旧契约
+/supervisor note <说明>      # 追加用户说明，不触发重新推断
+/supervisor details          # 完整有效契约：进度、规则、说明等
+/supervisor judge            # 空闲时手动核验；暂停中不会因此自动续跑
+/supervisor history [n]      # 当前 session 的判定历史，默认 20 条
+/supervisor usage            # 判官 token / 缓存 / 金额及最近调用
+/supervisor quota            # 主模型额度等待的配置、状态和错误分类
 ```
 
-契约字段（bootstrap 推断、enforce 滚动更新，存为会话内 custom entry，无需改仓库）：
-`mission` / `furthest_progress` / `next_steps` / `decision_policy`（何时调用哪个决策子agent）/
-`record_policy`（哪些问题记到哪） / `stop_conditions` / `autonomy_rules` / `user_notes`。
+`note` 是给监督判官的补充说明，不是直接发给主 Agent 的任务指令。改变目标、完成条件或限制时请用 `replan`；要给主 Agent 下令，在正常会话中输入。
 
-## 使用
+暂停不会丢失计数与已确认进度；`start` 不会覆盖暂停任务。恢复原任务用 `resume`，另起任务先 `cancel` 再 `start`。
 
-### 启用方式（会话级，默认不自动启用）
+## 启用策略与无人值守
 
-- 默认**任何会话都不会自动启动**（config `defaults.enabled: false`，项目 profile 也默认 false）；
-- 每个会话独立启用/停用，状态持久化在该会话内：
-  - `/supervisor start`：本会话启用并建立契约；重启该会话后仍保持启用；
-  - `pi --supervise`：仅本次进程启用（适合无人值守启动）；**显式传该 flag 会覆盖会话里已持久化的 off/paused 状态**（但不改写它，不带 flag 的下次启动仍按持久化状态）
-  - `/supervisor off`（或 `pause`）：本会话持久停用；`/supervisor resume` 恢复；
-  - `human-needed` 自动暂停也会持久化，避免你逐项处理时反复判定；
-- 项目配置里的 `"enabled": true` 表示**该项目下所有会话自动启用**，只建议用于专用无人值守 worktree；多任务共用的 worktree 保持 false，按会话 `/supervisor start`。
+默认 `enabled: false`，新会话不会自动启用。可以按会话执行 `start`，也可显式无人值守启动：
 
 ```bash
-# 交互式：正常 pi，然后
-/supervisor start              # 启用并立即推断契约（编辑框确认；直接提交=开始执行）
-/supervisor replan             # 重推断契约（目标/范围变了、或要补充信息时）
-/supervisor note <说明>        # 随时告诉监督者（会注入到之后每一次判定，最高优先级）
-/supervisor                    # 查看状态（armed/session/judge/计数/契约/quotaWait/最近一次停止原因/最近判定）
-/supervisor history [n]        # 查看本 session 的判定历史（默认 20 条）
-/supervisor quota              # 查看主模型额度等待：配置/当前状态/最后一次错误/分类结果
-/supervisor judge               # 立即手动判定一次（当场给结果/续跑）
-/supervisor pause | resume      # 手动暂停/恢复自动判定（= off/on）
-/supervisor off|on|reset       # 本会话停用/恢复/重置计数
-```
-
-- 每次**允许停止**（目标达成 / 需要人类 / 达到上限 / STOP 文件 / 判官连续失败）都会在转录里追加一条可见消息，写明允许停止的理由；
-- `verdicts.jsonl` 每条记录带 `sessionId` / `sessionName` / `sessionFile`，同一 cwd 下多个 session 可按 session 关联；
-
-# 无人值守：自动接受推断契约并立即开始
 pi --supervise
 ```
 
-软停止：`touch ~/.pi/agent/extensions/pi-supervisor/STOP`。
+`--supervise` 会在新会话首次正常停止时推断终点，并自动接受**目标明确、无待澄清问题且置信度足够**的候选。`autoConfirm: true` 也仅跳过清晰候选的人工确认，不代表允许猜测目标。
 
-### 怎么和判官沟通
+**会话中明确保存的状态优先于 `--supervise` 和项目默认值。** 已暂停、取消或完成的任务，重启时不会被 flag/配置重新激活。恢复用 `resume`，开始新任务用 `start`。
 
-**第一轮**弹的是编辑框（预填契约正文，末尾有「修改意见」区）：
+项目 `enabled: true` 会为该目录（含子目录）下尚无明确监督状态的会话自动推断，建议只用于专用无人值守 worktree。非交互环境没有确认 UI，无法用 `cancel` 跳过确认；含歧义的候选也不会自动启用。
 
-- **直接提交**（下方留空）→ 确认契约并立即开始执行；
-- **在下方写内容** → 视为修改意见，会**重新推断一次**契约（会通知「已收到你的意见，正在据此重新推断契约（第 2 次）…」）；
-- 只输入 `继续` / `确认` / `OK` 这类词 → 当作确认，不重新推断。
+软停止入口：
 
-**第二轮及以后**弹的是普通确认框（展示更新后的契约）：确认 = 开始；取消后会再给一个输入框让你继续补充意见（最多 3 轮，之后放弃启用）。
+```bash
+touch ~/.pi/agent/extensions/pi-supervisor/STOP
+```
 
-你写的意见会同时存入契约的 `user_notes`，之后**每次判官判定都会当作最高优先级约束**；也可以随时用 `/supervisor note <说明>` 只加说明、不触发重新推断。
+命中后 Supervisor 暂停，**不代表目标达成**。移除 STOP 文件后再 `resume`。
 
-**注意**：编辑框里的文字是给**判官**的（修正契约），不是直接发给主 Agent 的任务指令；要直接给主 Agent 下令，在正常会话输入里写。
+## 配置参考
 
-## 配置（可选覆盖）
-
-`~/.pi/agent/extensions/pi-supervisor/config.json`：
+配置文件为 `~/.pi/agent/extensions/pi-supervisor/config.json`，每次读取时按项目路径合并覆盖；完整示例见 [config.example.json](config.example.json)。
 
 ```jsonc
 {
   "defaults": { "enabled": false },
   "projects": {
-    "/abs/path": {
-      "enabled": false,             // true = 该项目所有会话自动启用（多任务 worktree 保持 false）
-      "autoConfirm": false,         // true = 跳过确认（无人值守）
-      "judgeModel": "<provider>/<judge-model>", // 主判官
-      "judgeFailover": true,                     // 主判官失败时是否自动切备用
-      "judgeFailoverModel": "<provider>/<fallback-model>", // 备用判官
+    "/abs/path/to/worktree": {
+      "enabled": false,
+      "autoConfirm": false,
+      "judgeModel": "<provider>/<judge-model>",
+      "judgeFailover": true,
+      "judgeFailoverModel": "<provider>/<fallback-model>",
       "judgeThinking": "low",
-      "judgeTimeoutMs": 120000,     // enforce 判官超时
-      "bootstrapTimeoutMs": 300000,  // bootstrap 判官超时（只读工具，慢）
-      "maxIterations": 300,         // 连续续跑上限（用户输入后重置）
-      "maxJudgeFailures": 2,        // 连续判官失败多少次后交还控制
-      "smartCompaction": true,
-      "enforceReadTools": false,    // enforce 判官是否带只读工具（慢但更严格）
-      "escalationAgent": "escalation", // 人类介入前必须先咨询的决策子agent
-      "quotaWait": {                       // 主模型额度耗尽时等待恢复（见下节）
+      "judgeTimeoutMs": 120000,
+      "bootstrapTimeoutMs": 300000,
+      "maxIterations": 300,          // 累计监督轮次上限，暂停/恢复和普通输入不清零
+      "maxJudgeFailures": 2,         // 达到连续失败上限后暂停
+      "smartCompaction": true,       // TUI 中在合适检查点整理上下文
+      "enforceReadTools": false,
+      "escalationAgent": "escalation", // 可用的升级诊断 agent，不是每个任务的强制步骤
+      "stopFile": "~/.pi/agent/extensions/pi-supervisor/STOP",
+      "logFile": "verdicts.jsonl",
+      "goal": null,                  // 可选的固定目标提示，仍需形成明确终点
+      "quotaWait": {
         "enabled": true,
-        "intervalMs": 600000,              // 固定探测间隔，默认 10 分钟（下限 5s，上限 24h）
-        "maxWaitMinutes": 0,               // 0 = 无限等待
-        "maxAttempts": 0,                  // 0 = 无限次探测
-        "permanentAsHumanNeeded": true,    // 需人类的错误（欠费/掉登录）立刻停并自动暂停
-        "extraPatterns": [],               // 追加「算额度」的正则（新 provider 不用改代码）
-        "ignorePatterns": []               // 强制排除的正则（优先级最高）
-      },
-      "goal": null                  // 可选：固定目标提示，仍会推断步骤/策略
+        "intervalMs": 600000,        // 默认 10 分钟，下限 5s，上限 24h
+        "maxWaitMinutes": 0,         // 0 = 无限
+        "maxAttempts": 0,            // 0 = 无限
+        "permanentAsHumanNeeded": true,
+        "extraPatterns": [],
+        "ignorePatterns": []
+      }
     }
   }
 }
 ```
 
-判官调用（独立进程，不加载本扩展、不开会话）：
+项目按精确路径或最长目录前缀匹配。项目字段覆盖 defaults，嵌套对象也是浅合并，覆盖 `quotaWait` 时请留意。
 
-```bash
-pi --print --no-session --no-extensions --no-skills --no-context-files \
-   [--tools read,grep,find,ls] --model <judgeModel> --thinking <level> "<prompt>"
-```
+### 判官、失败与证据
 
-- bootstrap 始终带只读工具；enforce 默认不带工具（约 8–9 秒/次）。
-- bootstrap 是 **session-first**：以当前 session 的「用户最初请求 + 最近对话 + 主 Agent 汇报」为主要依据推断契约；git log/status 作为辅助验证；
-  只有在 session 中明确提到文件/路径/计划时，判官才用只读工具（read/grep/find/ls）读取少量文件（≤ 8 次调用），**不默认扫描仓库/枚举 docs/读 AGENTS.md**。
-- 同一 cwd 下多个 session 各自 bootstrap、各自保存契约，互不影响。
-- 超时（`bootstrapTimeoutMs`，默认 300s）后自动**无工具重试一次**；再失败则生成**临时契约**继续推进（不阻塞任务），可用 `/supervisor replan` 重建。
-- 判官失败时 **fail-open 向"继续推进"**：按契约 `next_steps[0]` 继续，并写日志；
-  连续失败超过 `maxJudgeFailures` 才交还控制。
-- 所有事件写入 `verdicts.jsonl`（`contract` / `bootstrap-continue` / `enforce-start` /
-  `verdict` / `done` / `judge-failure` / `handler-error` …），便于事后审计。
+判官是独立 `pi --mode json --no-session --no-extensions --no-skills --no-context-files` 子进程，不加载本扩展：
 
-## 可见性（判官/压缩进行中你能看到什么）
+- 推断阶段可用只读工具，主要依据当前会话；只核对明确提及的关键事实，不默认扫描仓库。
+- 正常核验默认无工具；需要判官自行查证时可设置 `enforceReadTools: true`，会增加耗时。
+- 完成结论必须为每项完成条件提供对应证据；缺项、未完成项、规则/记录缺口、证据冲突或仍需人类时，都不能仅凭 `goal_achieved: true` 放行。
+- 缺少可验证证据时要求补证，不要求每次扫描仓库或重复整套流程。
+- 是否咨询决策 agent、哪些记录必须补齐，以已确认契约为准，不再给每条续跑消息附加固定的升级诊断长说明。
 
-- 判官开始工作时：通知 `开始推断任务契约（判官 <model>，带只读工具，最长约 Ns）`；
-- 判官运行期间：状态栏每 5 秒刷新 `判官推断任务契约中（已 Ns）` / `监督模型判定中（已 Ns）`（TUI 在 footer，pi-web 在状态区），不会"看起来卡死"；
-- 带工具推断超时/失败时：通知 `带工具推断超时/失败，改为无工具快速重试…`；
-- 契约确认/自动接受、判定完成/需要人类：均有通知；
-- **压缩时**：通知 `判定为可压缩检查点，开始压缩上下文（保留：…）`，状态栏显示 `压缩上下文中…`；完成后通知 `压缩完成（<before> → <after> tokens），继续任务`，失败则通知 `压缩失败（原因），直接继续任务`；
-- 全部事件写入 `verdicts.jsonl`（`bootstrap-start` / `bootstrap-retry-no-tools` / `enforce-start` / `compact-requested` / `compact-done` / `compact-failed` / `verdict` / `done` …）。
+主判官出现 provider 错误、空输出、非 JSON、超时或非零退出时，可用备用模型重试一次。推断阶段还会尝试一次无工具推断；仍失败就保留原状态，不建立新契约。
 
-## 人类介入门槛（升级诊断优先）
+正常核验失败不等于完成：未到连续失败上限时按现有契约继续核验，达到上限则暂停。手动 `judge` 失败不改变状态。错误详情、主备切换及输出尾部写入审计日志。
 
-出现需要确认/决策/阻塞时，流程固定为：
+### 可见性与历史
 
-```
-主 Agent 遇到需要确认/证据冲突/阻塞
-   └─ 先调用升级诊断子agent（默认 escalation，config: escalationAgent）
-        ├─ 它给出方案  → 按其方案继续执行（不停）
-        └─ 它判定必须人类介入 → 写明其结论并停止，等人类处理
-```
+状态栏保留当前主状态，推断/核验时附带已用时间，额度等待时显示倒计时。候选确认、放弃、暂停、取消、完成均有明确反馈。
 
-- bootstrap 会把这条规则写进契约的 decision_policy / stop_conditions；
-- enforcement 判官会检查：**没有先调用升级诊断、或没有它的结论，就不允许判 human_needed**；
-  未升级就请求人类会被记入 policy_violations，并让主 Agent 先去咨询升级诊断；
-- **还有可自主推进的工作时不允许停**：即使存在待人类裁决的事项，也会走登记/挂起待决项后继续独立单元，只有确实无事可做时才判 human_needed；
-- 每条续跑消息都会重述这条规则。
+`verdicts.jsonl` 记录推断、契约、判定、完成、取消、失败及额度事件，并附 `sessionId` / `sessionName` / `sessionFile`，方便区分同一目录下的不同会话。`history`、`usage` 按当前 session 查询。
 
-### 人类介入时自动暂停
+`usage` 统计判官调用（bootstrap / enforce / manual / retry），不包含主 Agent 自身 token，也不包含注入监督消息给主会话造成的间接开销；供应商未返回 usage 时不会估算成真实消耗。
 
-判官判 `human_needed` 时，supervisor 会**自动暂停自己**（避免你逐项确认时反复触发判定）：
+## 主模型额度耗尽：等待恢复
 
-- 停止消息会写明“已自动暂停…处理完后用 /supervisor resume 恢复”；
-- 暂停状态持久化到会话，重启 pi 也保持暂停；
-- 处理完毕后 `/supervisor resume`：恢复监督；若会话空闲且处于 TUI/RPC，会立即续跑一次继续任务。
+主 Agent 因额度/配额耗尽报错时，Supervisor 在停止边界等待后重试原请求，不会为每次探测调用判官或占用监督轮次。
 
-## 失败诊断与 fail over
+错误分类来自 `quota.ts`，只看错误文本，不绑定 provider：
 
-- **真实错误会被读出来并落盘**：判官子进程用 `--mode json` 运行，解析器会读取 assistant 消息的 `errorMessage` / `stopReason` / `diagnostics` 以及事件流里的 `error` / `auto_retry_start` / `auto_retry_end`，因此 `verdicts.jsonl` 里记的是**真实原因**（如 `provider=403 …FreeTierError`、`autoRetryFinal=429 …`），而不是笼统的 "output not JSON"。失败时还会存 `stdoutTail` / `stderrTail`（各 2000 字符），保证事后可回溯。
-- **通知与停止消息带原因**：fail-open 续跑消息、`⏹ 监督模型连续失败 N 次` 停止消息都会内嵌真实错误与 failover 记录（截断到 300–800 字符）。
-- **判官 fail over（单次）**：主判官因 *provider 错误 / 空回复 / 非 JSON / 超时 / 进程非 0 退出* 拿不到可用结论时，自动改用 `judgeFailoverModel` 重试一次（bootstrap / enforce / 手动判定都适用），并记 `judge-failover` 事件（含主判官的真实错误）。
-  - 启用：`"judgeFailover": true` + `"judgeFailoverModel": "<provider/model>"`；
-  - 关闭：`"judgeFailover": false`；
-  - 默认备用：见 `DEFAULTS.judgeFailoverModel`（建议改成你自己的备用模型）；
-  - 两个模型都失败时，错误信息会同时列出主、备两边的真实原因。
-- 只有在两个模型都拿不到结论、且连续失败超过 `maxJudgeFailures` 时才会停止无人值守（停止 ≠ 目标达成）。
-
-## 主模型额度耗尽：等待恢复后自动续跑
-
-主 Agent 因为**额度/配额用尽**而报错时（最典型的是 `Error: Codex error: The usage limit has been reached`），
-supervisor 不会就此交还控制，而是**在 settle 处阻塞等待，然后让 pi 重发同一个请求**，直到额度恢复。
-
-```
-主 Agent 报额度错 → settle(outcome=error)
-   └─ 按 errorMessage 文本分类（与 provider 无关）
-        ├─ quota      → 状态栏倒计时 + 阻塞等待 intervalMs → 剔除失败轮 → pi 重发同一请求
-        │                 ├─ 成功 → 下一次 settle 是 completed → 记 quota-recovered，正常走判官
-        │                 └─ 又失败 → 回到本分支，再等一个 intervalMs
-        ├─ permanent  → 立刻停（欠费/掉登录/区域/模型或工作区配置错），等待无用；按 human-needed 自动暂停
-        └─ other      → 不接管，维持原行为（瞬时错误由 pi 内置 auto-retry 负责）
-```
-
-**为什么可以一直等**：探测请求就是主 Agent 的真实请求，失败时 `usage` 全 0，**不花 token**。
-并且失败的那一轮会用 `context_edit`（`replacement: null`）从模型上下文里剔除 —— 这正是 pi 自己
-auto-retry 用的机制（`_omitRecoveryAttempt`）—— 所以重发出去的上下文和故障前**逐字节一致**，
-等 10 小时也不会让上下文增长一个 token。
-
-**阻塞在 settle handler 内**（而不是事后定时器）是有意的：`pi --print` / headless 下进程不会退出，
-所以无人值守也能等；同时 pi 在 handler 返回后会重新检查 abort 标志，**Esc 依然能立刻打断**。
-
-### 分类只看错误文本，不看 provider
-
-分桶规则在 `quota.ts`，全部来自本机真实会话语料，换主模型不需要改代码：
-
-| 桶 | 典型样本 | 行为 |
+| 分类 | 例子 | 行为 |
 |---|---|---|
-| `quota` | `Codex error: The usage limit has been reached`、`You have hit your ChatGPT usage limit (team plan). Try again in ~132 min.`、`429 {"type":"GoUsageLimitError"…}`、`429 {"code":"1310","message":"您已达到每周/每月使用上限…"}`、`insufficient_quota`、`quota exceeded`、`out of budget`、`subscription_sharing_usage_limit_exceeded` | 等待重试 |
-| `permanent` | `402 … Insufficient account funds`、`credit balance is too low`、`Login expired`、`invalid_api_key`、`unsupported_country_region_territory`、`model is not supported`、`No API provider registered`、`Privacy settings` | 立刻停 + 自动暂停 |
-| `other` | `429 status code (no body)`、`fetch failed`、`Connection error.`、`504 Gateway Time-out`、`servers are currently overloaded`、`inference exceeds tpm/rpm limit`、`terminated`、超时、abort 类 | **不接管** |
+| `quota` | `The usage limit has been reached`、`GoUsageLimitError`、每周/月上限、`insufficient_quota`、`out of budget` | 等待后重试 |
+| `permanent` | 欠费、`invalid_api_key`、登录过期、不支持的区域/模型、工作区配置错误 | 默认立即暂停，等待人工处理 |
+| `other` | 空体 429、tpm/rpm 限流、网络错误、504、超时、abort | 不接管，保留 pi 原有行为 |
 
-> `tpm/rpm` 这类 429 虽然同时带 `429` 和 `limit`，但是秒级恢复的限流，pi 内置 auto-retry 已经在管；
-> 分类器有专门的护栏把它挡在 `quota` 之外，不会误等几小时。
-
-新 provider 的措辞用配置解决，不用改代码：
+新 provider 措辞可以用配置补充：
 
 ```jsonc
-"quotaWait": { "extraPatterns": ["^MyGateway: daily cap"], "ignorePatterns": ["beta feature unavailable"] }
+"quotaWait": {
+  "extraPatterns": ["^MyGateway: daily cap"],
+  "ignorePatterns": ["beta feature unavailable"]
+}
 ```
 
-优先级：`ignorePatterns` > `extraPatterns` > `tpm/rpm` 护栏 > 内置 permanent > 内置 quota > other。
+优先级：`ignorePatterns` > `extraPatterns` > tpm/rpm 护栏 > 内置 permanent > 内置 quota > other。
 
-### 中断与上限
+- 默认每 10 分钟探测一次；`maxAttempts` / `maxWaitMinutes` 为 0 时不设总上限。
+- Esc 中断等待；`pause` / 确认后的 `cancel` 会使旧等待与探测失效；STOP 文件每 5 秒检查。
+- 达到等待上限、STOP 或永久性错误时进入暂停，不冒充“已完成”。
+- 识别到失败消息 entry 时，用 `context_edit` 从后续模型上下文移除该失败轮，避免重复堆积；这不删除对话历史，也不保证供应商不计费。
+- 普通用户输入会清零额度等待计数，但不清除监督进度或重新激活终态。
+- `/supervisor quota` 查看配置、等待状态、最后错误与分类；日志包含 `quota-detected` / `quota-probe` / `quota-recovered` / `quota-giveup` / `quota-permanent` / `quota-aborted` 等事件。
 
-- **Esc** → 立刻取消等待，正常 settle（记 `quota-aborted` reason=user-abort）；
-- **STOP 文件** → 每 5s 检查一次，命中就停（`quota-aborted` reason=stop-file）；
-- `maxAttempts` / `maxWaitMinutes`（默认都是 0 = 无限）→ 超限记 `quota-giveup` 并写一条可见停止消息；
-- 等待期间**完全不调判官**（判官常常和主 Agent 同账号，同样没额度），也不占用
-  `iterations` / `maxIterations` / `judgeFailures`；
-- 你手动发消息 = 接管，额度计数自动清零。
+## 恢复、兼容与边界
 
-### 可见性
-
-- 状态栏每 5s：`⏳ 等待额度恢复 · 第 3 次探测 · 已等 20m · 下次 9m40s 后（Esc 取消）`；
-- 通知：进入等待 / 额度已恢复 / 取消 / 放弃 / 需人类处理；
-- `verdicts.jsonl`：`quota-detected`（含命中的规则名）/ `quota-probe` / `quota-recovered` /
-  `quota-giveup` / `quota-permanent` / `quota-aborted`；
-- 会话内追加 `pi-supervisor-quota` custom entry（不进 LLM 上下文），记录 attempts / waitedMs / 错误文本；
-- `/supervisor quota` 随时查看当前配置、等待状态、最后一次错误和它的分类结果。
-
-### 测试
-
-`quota.ts` 是零依赖纯函数，单测覆盖本机采集的 30 类真实报错：
-
-```bash
-cd ~/.pi/agent/extensions/pi-supervisor && node --test quota.test.ts
-```
-
-## Token 统计
-
-- `/supervisor usage`：查看本进程累计 + 本 session 日志累计（token / 缓存 / 金额）+ 最近几次调用明细；
-- `/supervisor status` 也会显示 `judge tokens（本进程）`；
-- 统计范围：**判官调用**（bootstrap / enforce / manual / retry）与 **supervisor 触发的 compact**；每次调用以 `judge-usage` 事件写入 `verdicts.jsonl`（带 `kind` / `ms` / `usage`）；
-- 预备：判官子进程用 `--mode json` 运行，从事件流里读取每次 assistant turn 的 `usage` 并汇总；测试用 plain-text stub 时会退化为无 usage（不影响判定）；
-- 不包含：主 Agent 自身对话、以及 supervisor 注入消息（contract/continuation）给主会话带来的间接 token。
-
-## 兼容性（从 stop-supervisor 重命名）
-
-- 目录/配置：`~/.pi/agent/extensions/pi-supervisor/`；
-- 会话中旧版写入的 `stop-supervisor-contract` / `stop-supervisor-state` entry **仍会被读取并恢复**（契约与暂停状态）；新写入使用 `pi-supervisor-contract` / `pi-supervisor-state`；
-- 环境变量：新名 `PI_SUPERVISOR_CONFIG` / `PI_SUPERVISOR_DEBUG`，旧名 `STOP_SUPERVISOR_*` 仍可用；
-- 命令 `/supervisor` 与 CLI flag `--supervise` 不变。
-
-## 边界
-
-- 只处理 `outcome=completed` 的停止；**Esc/abort 绝不强行续跑**；有 queued 消息时不插手。
-- `outcome=error` 只在错误文本被判定为**额度/配额耗尽**时才接管（见「主模型额度耗尽」一节）；
-  其余 provider 错误维持原行为，一行不改。
-- print/json 模式进程会在 settle 后退出，无法热压缩；headless 长跑建议 RPC 或 `--supervise` 循环。
-- 契约存在会话里：resume/压缩后自动恢复，不会重新 bootstrap。
+- 每个 session 独立保存有效契约和状态；切换会话不会继承另一个会话的任务。
+- 已取消/完成的状态会压住历史契约；历史仍可查，但不会恢复为有效任务。
+- 老版本 `stop-supervisor-contract` / `stop-supervisor-state` 仍可读取。旧通用临时契约不再作为可执行授权；请重新 `start` 确认终点。
+- 新写入使用 `pi-supervisor-contract` / `pi-supervisor-state`；配置环境变量为 `PI_SUPERVISOR_CONFIG` / `PI_SUPERVISOR_DEBUG`，兼容旧 `STOP_SUPERVISOR_*` 名称。
+- `outcome=aborted` 不强行续跑；有排队消息时不插手。非额度类错误不接管。
+- pause/cancel、新任务、重新规划、人工接管或会话切换后，旧判官结果、额度定时器和压缩回调不得发送新指令或覆盖新状态。
+- 智能压缩仅在 TUI 路径使用；其他模式走普通监督续跑，不依赖热压缩。
+- 自动测试覆盖实际注册的命令/事件处理器和延迟回调；真实模型质量、供应商计费以及交互界面的视觉表现仍需在你的 pi 环境中验证。
 
 ## License
 

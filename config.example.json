@@ -30,7 +30,7 @@
     "/abs/path/to/a/dedicated/unattended/worktree": {
       "enabled": true,
       "autoConfirm": true,
-      "//": "Per-project keys override defaults shallowly. Only list what you want to change; enabled:true here means EVERY session under this path auto-arms, so reserve it for single-purpose unattended worktrees."
+      "//": "Per-project keys override defaults shallowly. enabled:true bootstraps sessions without explicit supervision state; saved pause/cancel/completed states win. autoConfirm accepts only clear endpoints. Reserve this for dedicated unattended worktrees."
     }
   }
 }

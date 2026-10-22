@@ -49,13 +49,13 @@ The extension's public registration interface stays `default function (pi: Exten
 
 **Interfaces:** Consume existing session custom entries and actual `ExtensionAPI` callbacks. Produce a persisted lifecycle with `inactive`, `drafting`, `active`, `paused`, `cancelled`, `completed` states; a monotonically changing operation generation/session identity that every asynchronous send/state mutation must validate. Internal naming is implementation-owned; external status and command semantics are fixed by the spec.
 
-- [ ] Write handler-level failing tests for: pause survives `supervise=true`; cancelled history cannot restore a contract; a second session starts clean; completed task cannot auto-restart; existing legacy armed/paused entries restore safely; input does not revive terminal states or erase persisted supervision progress.
-- [ ] Run `node --test supervisor.test.ts`; verify failures are the above real behavioral regressions, not missing SDK/runtime dependencies.
-- [ ] Implement the authoritative state and backwards-compatible restore, resetting closure state at session boundaries. Persist terminal tombstones so older contract entries cannot resurrect. Persist progress needed by pause/resume; cancellation clears task-local counters, verdict and quota state while retaining historical audit entries.
-- [ ] Add failing deferred-work tests: pause/cancel during enforce/manual/bootstrap, quota sleep and smart-compaction callback; cancel then start again must reject the old generation. Use controllable external judge responses/test timers rather than sleeping.
-- [ ] Guard all awaited results, failover/retry branches, quota probes and compaction callbacks before applying results or sending directives; never call the main agent's abort API for cancellation.
-- [ ] Run `node --test *.test.ts`; all lifecycle and existing quota tests pass.
-- [ ] Commit the tested lifecycle change.
+- [x] Write handler-level failing tests for: pause survives `supervise=true`; cancelled history cannot restore a contract; a second session starts clean; completed task cannot auto-restart; existing legacy armed/paused entries restore safely; input does not revive terminal states or erase persisted supervision progress.
+- [x] Run `node --test supervisor.test.ts`; verify failures are the above real behavioral regressions, not missing SDK/runtime dependencies.
+- [x] Implement the authoritative state and backwards-compatible restore, resetting closure state at session boundaries. Persist terminal tombstones so older contract entries cannot resurrect. Persist progress needed by pause/resume; cancellation clears task-local counters, verdict and quota state while retaining historical audit entries.
+- [x] Add failing deferred-work tests: pause/cancel during enforce/manual/bootstrap, quota sleep and smart-compaction callback; cancel then start again must reject the old generation. Use controllable external judge responses/test timers rather than sleeping.
+- [x] Guard all awaited results, failover/retry branches, quota probes and compaction callbacks before applying results or sending directives; never call the main agent's abort API for cancellation.
+- [x] Run `node --test *.test.ts`; all lifecycle and existing quota tests pass.
+- [x] Commit the tested lifecycle change.
 
 ### Task 2: Explicit commands and transactional confirmation
 
@@ -63,13 +63,13 @@ The extension's public registration interface stays `default function (pi: Exten
 
 **Interfaces:** Consume Task 1 lifecycle and generation guards. Produce `start`, `pause`, `resume`, `cancel` as the sole primary task controls; secondary `judge/replan/note/history/usage/quota` must not bypass those controls.
 
-- [ ] Write failing command tests: decline cancel leaves contract/progress unchanged; confirm cancel persists cancelled state and removes the effective contract without aborting main execution; unavailable confirmation UI cannot cancel; `resume` without a paused contract gives actionable guidance; deprecated `on/off/reset` do not mutate state; repeated start of an active task is idempotent.
-- [ ] Run `node --test supervisor.test.ts` and observe those behavioral failures.
-- [ ] Implement cancellation with a default-negative confirmation, clear task data only after approval, and expose a persistent readable status. If the available SDK confirmation helper does not default negative, use a select with “不取消” as the first option. Without UI, refuse destructive cancellation rather than treating missing UI as approval.
-- [ ] Write failing tests for initial contract-confirmation decline, bootstrap failure, and replan decline/failure retaining the previous contract/status. Also test overlapping draft/cancel operations and manual `judge` while paused/terminal cannot implicitly resume execution.
-- [ ] Make contract establishment transactional: build candidate locally, confirm, then commit; restore previous state on decline/failure. No provisional fallback task. `--supervise`/profile auto-confirm remain allowed only for a clear candidate and a never-explicitly-stopped session, not as overrides of user task state.
-- [ ] Run `node --test *.test.ts`; all command, confirmation, async and quota regressions pass.
-- [ ] Commit the tested command change.
+- [x] Write failing command tests: decline cancel leaves contract/progress unchanged; confirm cancel persists cancelled state and removes the effective contract without aborting main execution; unavailable confirmation UI cannot cancel; `resume` without a paused contract gives actionable guidance; deprecated `on/off/reset` do not mutate state; repeated start of an active task is idempotent.
+- [x] Run `node --test supervisor.test.ts` and observe those behavioral failures.
+- [x] Implement cancellation with a default-negative confirmation, clear task data only after approval, and expose a persistent readable status. If the available SDK confirmation helper does not default negative, use a select with “不取消” as the first option. Without UI, refuse destructive cancellation rather than treating missing UI as approval.
+- [x] Write failing tests for initial contract-confirmation decline, bootstrap failure, and replan decline/failure retaining the previous contract/status. Also test overlapping draft/cancel operations and manual `judge` while paused/terminal cannot implicitly resume execution.
+- [x] Make contract establishment transactional: build candidate locally, confirm, then commit; restore previous state on decline/failure. No provisional fallback task. `--supervise`/profile auto-confirm remain allowed only for a clear candidate and a never-explicitly-stopped session, not as overrides of user task state.
+- [x] Run `node --test *.test.ts`; all command, confirmation, async and quota regressions pass.
+- [x] Commit the tested command change.
 
 ### Task 3: Short endpoint contract, concise evidence checks and documentation
 
@@ -77,15 +77,24 @@ The extension's public registration interface stays `default function (pi: Exten
 
 **Interfaces:** Consume confirmed lifecycle/contract operations. Extend the stored contract with explicit completion criteria and necessary boundaries while retaining legacy policy/user-note data for compatibility. Runtime progress updates may change only progress/next steps, never mission/criteria/boundaries/policies. Verdicts must support criterion-level evidence, unmet conditions and goal/scope conflict without accepting a bare unsupported `goal_achieved:true`.
 
-- [ ] Write failing behavior tests: short confirmation exposes goal/criteria/restrictions rather than full policy essays; supplementary details remain available; a runtime contract update cannot replace a confirmed endpoint; legacy contracts preserve necessary restrictions.
-- [ ] Write failing verdict tests: completion requires evidence covering every criterion; absent evidence, contradictory goal/human flags or remaining unmet conditions cannot complete; conflict proposes re-confirmation without silently modifying the endpoint; an ordinary continue response produces a compact actionable message.
-- [ ] Run `node --test supervisor.test.ts` and confirm the missing behavior failures.
-- [ ] Simplify bootstrap prompt to infer an explicit endpoint, few checkable criteria and essential boundaries from session evidence; preserve confirmed additional constraints without hardcoded verbose “keep going” essays. Low-confidence/critical-open-question candidates cannot auto-activate.
-- [ ] Simplify enforcement to criterion verification and concise evidence/unmet/next-step output. Request deeper investigation only on missing/conflicting evidence; goal/range changes require user confirmation. Produce a completed lifecycle only for supported success and persist it before stopping.
-- [ ] Replace verbose default status with current lifecycle, endpoint, compact progress and actionable next command. Put model/usage/history and full retained contract details behind existing or explicit detail commands. Update README and command help, including migration from on/off/reset, cancellation scope and flag precedence.
-- [ ] Run `node --test *.test.ts`, `git diff --check`, and a real module import smoke check `node -e "import('./index.ts').then(m => console.log(typeof m.default))"`; expect all tests passing, no whitespace errors and `function`.
-- [ ] Commit final integration/docs. Report changed files, test counts/commands, known limitations and any unfulfilled spec requirement; do not claim interactive TUI verification without actually performing it.
+- [x] Write failing behavior tests: short confirmation exposes goal/criteria/restrictions rather than full policy essays; supplementary details remain available; a runtime contract update cannot replace a confirmed endpoint; legacy contracts preserve necessary restrictions.
+- [x] Write failing verdict tests: completion requires evidence covering every criterion; absent evidence, contradictory goal/human flags or remaining unmet conditions cannot complete; conflict proposes re-confirmation without silently modifying the endpoint; an ordinary continue response produces a compact actionable message.
+- [x] Run `node --test supervisor.test.ts` and confirm the missing behavior failures.
+- [x] Simplify bootstrap prompt to infer an explicit endpoint, few checkable criteria and essential boundaries from session evidence; preserve confirmed additional constraints without hardcoded verbose “keep going” essays. Low-confidence/critical-open-question candidates cannot auto-activate.
+- [x] Simplify enforcement to criterion verification and concise evidence/unmet/next-step output. Request deeper investigation only on missing/conflicting evidence; goal/range changes require user confirmation. Produce a completed lifecycle only for supported success and persist it before stopping.
+- [x] Replace verbose default status with current lifecycle, endpoint, compact progress and actionable next command. Put model/usage/history and full retained contract details behind existing or explicit detail commands. Update README and command help, including migration from on/off/reset, cancellation scope and flag precedence.
+- [x] Run `node --test *.test.ts`, `git diff --check`, and a real module import smoke check `node -e "import('./index.ts').then(m => console.log(typeof m.default))"`; expect all tests passing, no whitespace errors and `function`.
+- [x] Commit final integration/docs. Report changed files, test counts/commands, known limitations and any unfulfilled spec requirement; do not claim interactive TUI verification without actually performing it.
 
 ## Final acceptance
 
 A fresh read-only reviewer checks the actual diff and approved spec, concentrating on the five Review Focus conditions. Parent validates findings against source/tests, fixes material issues with regression tests, and reruns the full test suite. No implementation-mode or product-scope expansion is authorized by this plan.
+
+## Execution evidence
+
+- Tasks 1–3 were integrated together because lifecycle, transactional commands and verdict application share the same extension closure; final delivery uses one integrated correction/docs commit after the initial implementation commit.
+- Behavioral red run: 35 tests, 16 failures. First green run: 35/35 handler tests and 12/12 quota tests.
+- Fresh read-only review found no P0/P1 and one P2: malformed verdict blocker fields could be silently discarded. Added failing string/null/invalid-array regressions, fixed conservative validation, and also reproduced/fixed a malformed `human_needed` flag.
+- Final verification: `node --test *.test.ts` — 60 passed, 0 failed; dynamic import prints `function`; `git diff --check` is clean.
+- README and example-config comments now match command migration, cancellation scope, state precedence, short endpoint confirmation and evidence checks.
+- No live TUI, real-provider judge-quality or billing verification was performed.
