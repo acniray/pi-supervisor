@@ -114,6 +114,8 @@ interface Config {
 interface Contract {
   version: 1;
   mission: string;
+  completion_criteria: string[];
+  boundaries: string[];
   furthest_progress: string;
   next_steps: string[];
   decision_policy: string[];
@@ -132,6 +134,8 @@ interface Verdict {
   goal_achieved?: boolean;
   human_needed?: boolean;
   reason?: string;
+  criteria_met?: string[];
+  unmet_conditions?: string[];
   next_step?: string;
   contract_updates?: Partial<Contract>;
   policy_violations?: string[];
@@ -591,9 +595,13 @@ function asStringArray(value: unknown, max = 30): string[] {
 }
 
 function normalizeContract(raw: Record<string, unknown>): Contract {
+  const completionCriteria = asStringArray(raw.completion_criteria ?? raw.completionCriteria ?? raw.criteria ?? raw.completion_conditions);
+  const boundaries = asStringArray(raw.boundaries ?? raw.necessary_boundaries ?? raw.restrictions ?? raw.necessary_restrictions);
   return {
     version: 1,
     mission: typeof raw.mission === "string" && raw.mission.trim() ? raw.mission.trim() : "(未推断出目标)",
+    completion_criteria: completionCriteria,
+    boundaries,
     furthest_progress: typeof raw.furthest_progress === "string" ? raw.furthest_progress.trim() : "(未知)",
     next_steps: asStringArray(raw.next_steps),
     decision_policy: asStringArray(raw.decision_policy),
@@ -612,14 +620,10 @@ function mergeContract(contract: Contract, updates: Partial<Contract> | undefine
   const mergedNotes = asStringArray(updates.user_notes);
   return {
     ...contract,
-    mission: typeof updates.mission === "string" && updates.mission.trim() ? updates.mission.trim() : contract.mission,
+    // Runtime progress updates may change only progress/next steps and append notes.
     furthest_progress: typeof updates.furthest_progress === "string" && updates.furthest_progress.trim()
       ? updates.furthest_progress.trim() : contract.furthest_progress,
     next_steps: updates.next_steps ? asStringArray(updates.next_steps) : contract.next_steps,
-    decision_policy: updates.decision_policy ? asStringArray(updates.decision_policy) : contract.decision_policy,
-    record_policy: updates.record_policy ? asStringArray(updates.record_policy) : contract.record_policy,
-    stop_conditions: updates.stop_conditions ? asStringArray(updates.stop_conditions) : contract.stop_conditions,
-    autonomy_rules: updates.autonomy_rules ? asStringArray(updates.autonomy_rules) : contract.autonomy_rules,
     user_notes: mergedNotes.length ? [...contract.user_notes, ...mergedNotes] : contract.user_notes,
     updated_at: new Date().toISOString(),
   };
@@ -629,17 +633,13 @@ function contractSummary(contract: Contract): string {
   const list = (items: string[], max = 8) =>
     items.length ? items.slice(0, max).map((item, i) => `  ${i + 1}. ${item}`).join("\n") : "  (无)";
   return [
-    contract.provisional
-      ? "⚠ 临时契约（判官推断失败时生成）：只在 stop_conditions 明确满足时判达成，其余继续推进；可用 /supervisor replan 重建。"
-      : "",
     `目标: ${truncateMiddle(contract.mission, 600)}`,
+    `完成条件:\n${list(contract.completion_criteria)}`,
+    `必要限制:\n${list(contract.boundaries)}`,
     `最远进度: ${truncateMiddle(contract.furthest_progress, 800)}`,
     `后续步骤:\n${list(contract.next_steps)}`,
-    `决策升级(调用决策子agent):\n${list(contract.decision_policy, 5)}`,
-    `记录规则:\n${list(contract.record_policy, 5)}`,
-    `停止条件:\n${list(contract.stop_conditions, 5)}`,
-    `无人值守规则:\n${list(contract.autonomy_rules, 5)}`,
     contract.user_notes.length ? `用户补充说明:\n${list(contract.user_notes, 5)}` : "",
+    `附加信息（决策/记录/停止/无人值守规则）:\n${list([...contract.decision_policy, ...contract.record_policy, ...contract.stop_conditions, ...contract.autonomy_rules], 20)}`,
   ].filter(Boolean).join("\n\n");
 }
 
@@ -853,6 +853,8 @@ ${sessionExcerpt(ctx)}
 ## 需要推断的内容（严格 JSON 输出，不要输出其它文字）
 {
   "mission": "当前 session 要达成的最终目标的可验证定义（以 session 里的用户请求为准，精确、可判定）",
+  "completion_criteria": ["少量、可核验的完成条件：做到什么算完成"],
+  "boundaries": ["必要限制：范围、禁止事项、必须由人决定的边界"],
   "furthest_progress": "根据 session 汇报判断已经推进到哪一步；列出证据锚点（提交/文件/测试）；session 没说的不要编造",
   "next_steps": ["从当前状态到目标的有序、最小可执行步骤；每步应可独立实现/验证/提交"],
   "decision_policy": ["哪些情况必须先调用决策子agent（升级诊断）配合决策：触发条件/调用哪个/需要提供什么/结论记录到哪里。必须把用户指定的 ${escalation} 排在第一位，并写明“它给方案就按方案继续、它判必须人类介入才停下”。"],
@@ -941,6 +943,9 @@ export default function (pi: ExtensionAPI) {
   let quotaWaiting = false;
   const quotaState = { attempts: 0, waitedMs: 0, startedAt: 0, lastError: "", lastRule: "" };
   let armed: boolean | undefined; // undefined = not decided yet for this session
+  let lifecycle: "inactive" | "drafting" | "active" | "paused" | "cancelled" | "completed" = "inactive";
+  let operationGeneration = 0;
+  function bumpGeneration() { operationGeneration += 1; return operationGeneration; }
   let contract: Contract | undefined;
   let lastVerdict: Verdict | undefined;
   let judging = false;
@@ -971,8 +976,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   function persistState(stateArmed: boolean, statePaused: boolean, reason: string): void {
+    const ls = statePaused ? "paused" : (stateArmed ? "active" : (lifecycle === "cancelled" ? "cancelled" : (lifecycle === "completed" ? "completed" : "inactive")));
+    if (statePaused) lifecycle = "paused";
+    else if (stateArmed) lifecycle = "active";
     try {
-      pi.appendEntry(STATE_TYPE, { armed: stateArmed, paused: statePaused, reason, at: new Date().toISOString() });
+      pi.appendEntry(STATE_TYPE, { armed: stateArmed, paused: statePaused, lifecycle: ls, reason, at: new Date().toISOString() });
     } catch {
       // best effort
     }
@@ -1029,18 +1037,34 @@ export default function (pi: ExtensionAPI) {
           [STATE_TYPE, LEGACY_STATE_TYPE].includes((entry as { customType?: string }).customType ?? ""),
       );
       if (lastState) {
-        const data = ((lastState as { data?: Record<string, unknown> }).data || {}) as { armed?: boolean; paused?: boolean; reason?: string };
-        if (data.paused === true) {
+        const data = ((lastState as { data?: Record<string, unknown> }).data || {}) as { armed?: boolean; paused?: boolean; reason?: string; lifecycle?: string };
+        const persistedLifecycle = typeof data.lifecycle === "string" ? data.lifecycle : undefined;
+        if (persistedLifecycle === "cancelled" || persistedLifecycle === "completed") {
+          lifecycle = persistedLifecycle as "cancelled" | "completed";
+          armed = false;
+          pausedByStop = false;
+          contract = undefined; // terminal tombstone: historical contract entries must not resurrect
+          debugLog(`session restored as ${persistedLifecycle}`);
+        } else if (data.paused === true || persistedLifecycle === "paused") {
           pausedByStop = true;
-          armed = false; // keep the session paused across restarts until /supervisor resume
+          armed = false;
+          lifecycle = "paused";
           debugLog(`session restored as paused (${data.reason || "?"})`);
-        } else if (data.armed === true) {
-          armed = true; // session was explicitly armed (e.g. /supervisor start)
+        } else if (data.armed === true || persistedLifecycle === "active") {
+          armed = true;
+          pausedByStop = false;
+          lifecycle = "active";
           debugLog(`session restored as armed (${data.reason || "?"})`);
-        } else if (data.armed === false) {
-          armed = false; // session was explicitly disarmed
+        } else if (data.armed === false || persistedLifecycle === "inactive") {
+          armed = false;
+          pausedByStop = false;
+          lifecycle = "inactive";
           debugLog(`session restored as disarmed (${data.reason || "?"})`);
         }
+      }
+      // Terminal tombstones: ignore historical contract entries.
+      if (lifecycle === "cancelled" || lifecycle === "completed") {
+        contract = undefined;
       }
     } catch (error) {
       debugLog(`contract restore failed: ${String(error)}`);
@@ -1171,35 +1195,23 @@ export default function (pi: ExtensionAPI) {
       if (!result.ok || !json) {
         judgeFailures += 1;
         log({ event: "bootstrap-failure", error: result.error, detail: result.detail, model: result.model, failovers: result.failovers, ms: result.ms, stdoutTail: result.raw, stderrTail: result.stderr });
-        const provisional: Contract = normalizeContract({
-          mission: "继续推进当前任务：读取进度/计划文档，完成所有已批准且可安全执行的单元。",
-          furthest_progress: "(判官不可用；以仓库与进度文档为准自行确认)",
-          next_steps: [
-            "读取进度/计划/矩阵文档，确认当前状态与下一个未闭环单元",
-            "完成该单元（实现/验证/审查/提交）后进入下一个",
-          ],
-          decision_policy: ["遇到证据冲突、连续失败或无回退保障的决策时，调用项目升级诊断 agent，并记录结论"],
-          record_policy: ["按仓库现有约定登记问题与残差，不新建平行台账"],
-          stop_conditions: ["所有已批准且可安全执行的单元完成且残差已登记", "出现必须人类介入的凭据/环境/授权阻塞"],
-          autonomy_rules: ["不停下汇报、不等确认，单元闭环后直接进入下一个"],
-          provisional: true,
-          confirmed_by_user: false,
-        });
-        contract = provisional;
-        persistContract();
-        log({ event: "contract-provisional", error: result.error, contract: provisional });
-        ctx.ui.notify("pi-supervisor: 契约推断失败，先用临时契约继续推进（/supervisor replan 可重建）", "warning");
-        return contract;
+        ctx.ui.notify("pi-supervisor: 契约推断失败，未建立契约（/supervisor replan 重试）", "warning");
+        return undefined;
       }
       const candidate = normalizeContract(json);
       const openQuestions = asStringArray(json.open_questions, 5);
-      const auto = profile.autoConfirm === true || pi.getFlag("supervise") === true || !ctx.hasUI;
+      const clearCandidate = (json.confidence === "high" || json.confidence === "medium") && openQuestions.length === 0;
+      const auto = (profile.autoConfirm === true || pi.getFlag("supervise") === true || !ctx.hasUI) && clearCandidate;
       if (auto) {
+        candidate.confirmed_by_user = true;
         contract = candidate;
         persistContract();
         log({ event: "contract", auto: true, confidence: json.confidence, contract });
-        if (ctx.hasUI) ctx.ui.notify("pi-supervisor: 契约已自动接受（--supervise），立即开始执行", "info");
+        if (ctx.hasUI) ctx.ui.notify("pi-supervisor: 契约已自动接受，立即开始执行", "info");
         return contract;
+      }
+      if ((profile.autoConfirm === true || pi.getFlag("supervise") === true) && !clearCandidate) {
+        if (ctx.hasUI) ctx.ui.notify("pi-supervisor: 候选契约不够明确，需要你确认", "warning");
       }
       if (ctx.hasUI) {
         ctx.ui.notify(`pi-supervisor: 已推断任务契约（confidence=${String(json.confidence ?? "?")}），请确认`, "info");
@@ -1448,16 +1460,18 @@ export default function (pi: ExtensionAPI) {
     captureSessionMeta(ctx);
     logCtx = { cwd, logFile: profile.logFile };
     const canHotCompact = ctx.mode === "tui" || ctx.mode === "rpc";
-    if (pi.getFlag("supervise") === true) {
-      // An explicit --supervise launch always wins over a persisted off/paused state,
-      // but it does not rewrite the persisted state (plain restarts keep it).
+    const terminal = lifecycle === "cancelled" || lifecycle === "completed" || lifecycle === "paused";
+    if (pi.getFlag("supervise") === true && !terminal) {
+      // --supervise only auto-arms a never-explicitly-stopped session.
       armed = true;
       pausedByStop = false;
+      lifecycle = "active";
     } else if (armed === undefined) {
-      armed = profile.enabled === true;
+      armed = (profile.enabled === true) && !terminal;
+      if (armed) lifecycle = "active";
     }
     debugLog(`settle cwd=${cwd} mode=${ctx.mode} armed=${armed} contract=${contract ? "yes" : "no"} outcome=${event.outcome} pending=${ctx.hasPendingMessages()}`);
-    if (!armed || judging || quotaWaiting) return;
+    if (!armed || judging || quotaWaiting || lifecycle === "cancelled" || lifecycle === "completed" || lifecycle === "paused") return;
     if (ctx.hasPendingMessages() || (event.context.pendingMessages?.length ?? 0) > 0) return; // pi will continue anyway
 
     if (event.outcome !== "completed") {
@@ -1591,7 +1605,13 @@ export default function (pi: ExtensionAPI) {
         contextPercent: (() => { try { return ctx.getContextUsage()?.percent ?? null; } catch { return null; } })(),
       });
 
-      if (verdict.goal_achieved === true) {
+      const criteriaMet = Array.isArray((verdict as any).criteria_met) ? (verdict as any).criteria_met : [];
+      const unmet = Array.isArray((verdict as any).unmet_conditions) ? (verdict as any).unmet_conditions : asStringArray(verdict.records_missing);
+      const hasConflict = verdict.goal_achieved === true && verdict.human_needed === true;
+      const evidenceOk = criteriaMet.length > 0 || (typeof verdict.reason === "string" && verdict.reason.trim().length > 20);
+      const allCriteriaCovered = contract.completion_criteria.length === 0 || criteriaMet.length >= contract.completion_criteria.length;
+      if (verdict.goal_achieved === true && !hasConflict && evidenceOk && allCriteriaCovered && unmet.length === 0) {
+        lifecycle = "completed";
         const stopText = [
           "[pi-supervisor] ✅ 允许停止 — 目标已达成",
           verdict.reason ? `判定依据：${verdict.reason}` : "",
@@ -1600,9 +1620,18 @@ export default function (pi: ExtensionAPI) {
           `判定序号：第 ${iterations + 1} 次`,
         ].filter(Boolean).join("\n");
         iterations = 0;
+        armed = false;
+        persistState(false, false, "completed");
+        try { pi.appendEntry(STATE_TYPE, { armed: false, paused: false, lifecycle: "completed", reason: "completed", at: new Date().toISOString() }); } catch { /* noop */ }
         ctx.ui.notify(`pi-supervisor: 判定目标已达成 — ${verdict.reason || ""}`, "info");
         log({ event: "done", verdict, stopText });
         return stopBoundary(stopText);
+      }
+      if (verdict.goal_achieved === true && (!evidenceOk || !allCriteriaCovered || unmet.length > 0 || hasConflict)) {
+        // Not enough evidence / contradictory flags: do not complete; request evidence.
+        ctx.ui.notify("pi-supervisor: 证据不足或存在冲突，继续推进并补证", "warning");
+        verdict.goal_achieved = false;
+        if (!verdict.next_step) verdict.next_step = "补充证据覆盖所有完成条件，解决冲突后再判定";
       }
 
       if (verdict.human_needed === true) {
@@ -1664,6 +1693,7 @@ export default function (pi: ExtensionAPI) {
             let tries = 0;
             const attempt = () => {
               tries += 1;
+              if (lifecycle !== "active") return; // cancelled/paused/completed: drop late result
               try {
                 if (ctx.isIdle()) {
                   pi.sendUserMessage(text);
@@ -1734,18 +1764,28 @@ export default function (pi: ExtensionAPI) {
       const profile = resolveProfile(ctx.cwd);
       captureSessionMeta(ctx);
       logCtx = { cwd: ctx.cwd, logFile: profile.logFile };
-      if (sub === "off" || sub === "pause") {
+      if (sub === "pause") {
+        if (lifecycle === "cancelled" || lifecycle === "completed") {
+          ctx.ui.notify(`pi-supervisor: 当前状态为 ${lifecycle}，无法暂停；用 /supervisor start 建立新任务`, "warning");
+          return;
+        }
         armed = false;
         pausedByStop = true;
-        persistState(false, false, `manual ${sub}`);
-        ctx.ui.notify(`pi-supervisor: 本会话已暂停（${sub}）；用 /supervisor resume 恢复`, "info");
+        lifecycle = "paused";
+        persistState(false, true, "manual pause");
+        ctx.ui.notify("pi-supervisor: 本会话已暂停；契约与进度保留，用 /supervisor resume 恢复", "info");
         return;
       }
-      if (sub === "on" || sub === "resume") {
+      if (sub === "resume") {
+        if (lifecycle !== "paused") {
+          ctx.ui.notify("pi-supervisor: 没有可恢复的暂停任务；请用 /supervisor start 建立新任务", "warning");
+          return;
+        }
         armed = true;
         pausedByStop = false;
+        lifecycle = "active";
         iterations = 0;
-        persistState(true, false, `resume ${sub}`);
+        persistState(true, false, "resume");
         ctx.ui.notify("pi-supervisor: 已恢复监督（resume）", "info");
         const canAutoStart = ctx.mode === "tui" || ctx.mode === "rpc";
         if (contract && canAutoStart && ctx.isIdle()) {
@@ -1761,10 +1801,100 @@ export default function (pi: ExtensionAPI) {
         }
         return;
       }
-      if (sub === "reset") {
+      if (sub === "cancel") {
+        if (lifecycle === "cancelled") {
+          ctx.ui.notify("pi-supervisor: 当前任务已取消", "info");
+          return;
+        }
+        if (!contract && lifecycle !== "active" && lifecycle !== "paused" && lifecycle !== "drafting") {
+          ctx.ui.notify(`pi-supervisor: 当前无有效任务（状态：${lifecycle}）`, "info");
+          return;
+        }
+        // Default-negative confirmation.
+        let approved = false;
+        try {
+          if (typeof ctx.ui.select === "function") {
+            const choice = await ctx.ui.select("确认取消监督？（默认不取消）", ["不取消", "取消"]);
+            approved = choice === "取消";
+          } else if (typeof ctx.ui.confirm === "function") {
+            approved = await ctx.ui.confirm("确认取消监督？", "取消将移除有效契约与监督进度，但不中断主 Agent。默认：不取消");
+          }
+        } catch {
+          approved = false;
+        }
+        if (!approved) {
+          ctx.ui.notify("pi-supervisor: 已放弃取消，状态不变", "info");
+          return;
+        }
+        // Clear effective contract and progress; persist terminal tombstone.
+        bumpGeneration();
+        armed = false;
+        pausedByStop = false;
+        lifecycle = "cancelled";
+        contract = undefined;
+        lastVerdict = undefined;
         iterations = 0;
         judgeFailures = 0;
-        ctx.ui.notify("pi-supervisor: 计数已重置", "info");
+        resetQuotaState();
+        persistState(false, false, "cancelled");
+        // persist terminal tombstone explicitly
+        try { pi.appendEntry(STATE_TYPE, { armed: false, paused: false, lifecycle: "cancelled", reason: "cancelled", at: new Date().toISOString() }); } catch { /* noop */ }
+        ctx.ui.notify("pi-supervisor: 已取消本次监督；契约与进度已清除，主 Agent 继续运行。用 /supervisor start 建立新任务", "info");
+        return;
+      }
+      if (sub === "start" || sub === "replan") {
+        if (sub === "replan" && lifecycle !== "cancelled" && lifecycle !== "completed") {
+          contract = undefined;
+        }
+        if (lifecycle === "cancelled" || lifecycle === "completed") {
+          contract = undefined;
+        }
+        if (lifecycle === "active") {
+          ctx.ui.notify("pi-supervisor: 已在监督中；用 /supervisor status 查看状态", "info");
+          return;
+        }
+        armed = true;
+        pausedByStop = false;
+        lifecycle = "active";
+        iterations = 0;
+        persistState(true, false, `start ${sub}`);
+        const built = await ensureContract(ctx, profile);
+        if (!built) {
+          // decline/failure: revert to previous inactive state, do not imply activation
+          if (lifecycle === "active" && !contract) {
+            armed = false;
+            lifecycle = "inactive";
+            persistState(false, false, "start-declined");
+          }
+          ctx.ui.notify("pi-supervisor: 未建立契约，状态保持不变", "warning");
+          return;
+        }
+        const canAutoStart = ctx.mode === "tui" || ctx.mode === "rpc";
+        if (!canAutoStart) {
+          ctx.ui.notify("pi-supervisor: 契约已就绪；在当前会话的下一次 stop 起按契约监督", "info");
+        } else if (ctx.isIdle()) {
+          const firstStep = built.next_steps[0] || "读取进度/计划文档确认当前状态，然后按 mission 继续下一个未闭环单元";
+          log({ event: "command-continue", iteration: 1, firstStep });
+          ctx.ui.notify("pi-supervisor: 契约已就绪，开始执行", "info");
+          try {
+            pi.sendUserMessage(buildContinuation({
+              escalationAgent: profile.escalationAgent || DEFAULTS.escalationAgent,
+              iteration: 1,
+              reason: "监督契约已确认，立即开始执行。",
+              nextStep: firstStep,
+              contract: built,
+              showContract: true,
+            }));
+          } catch (error) {
+            log({ event: "command-continue-failed", error: String(error) });
+          }
+        } else {
+          ctx.ui.notify("pi-supervisor: 契约已就绪；当前 run 未结束，下一次 stop 起按契约监督", "info");
+        }
+        return;
+      }
+      if (sub === "on" || sub === "off" || sub === "reset") {
+        ctx.ui.notify("pi-supervisor: on/off/reset 已弃用；请使用 start/pause/resume/cancel/status", "info");
         return;
       }
       if (sub === "note") {
@@ -1821,11 +1951,17 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("pi-supervisor: 还没有契约；先 /supervisor start 建立", "warning");
           return;
         }
+        if (lifecycle !== "active" && lifecycle !== "paused") {
+          ctx.ui.notify("pi-supervisor: 当前无有效监督任务，不能手动判定", "warning");
+          return;
+        }
+        if (lifecycle === "paused") {
+          ctx.ui.notify("pi-supervisor: 已暂停；手动判定不会恢复执行", "info");
+        }
         if (!ctx.isIdle()) {
           ctx.ui.notify("pi-supervisor: 当前 run 未结束；它 stop 时会自动判定", "warning");
           return;
         }
-        armed = true;
         ctx.ui.notify("pi-supervisor: 手动判定一次…", "info");
         const esc = profile.escalationAgent || DEFAULTS.escalationAgent;
         const result = await runJudge(
@@ -1877,7 +2013,8 @@ export default function (pi: ExtensionAPI) {
           missingRecords: asStringArray(verdict.records_missing, 5),
         });
         ctx.ui.notify("pi-supervisor: 手动判定 → 继续推进", "info");
-        pi.sendUserMessage(continuation);
+        if (lifecycle === "active") pi.sendUserMessage(continuation);
+        else ctx.ui.notify("pi-supervisor: 当前已暂停，未发送续跑指令", "info");
         return;
       }
       if (sub === "quota") {
@@ -1936,7 +2073,7 @@ export default function (pi: ExtensionAPI) {
         ? `${String(last.event) === "done" ? "✅ 目标达成" : String(last.event) === "human-needed" ? "⛔ 需人类" : "⏹ 非达成停止"} — ${truncateMiddle(String((last.verdict as Verdict | undefined)?.reason || last.error || "(无理由)"), 300)}`
         : "(本 session 尚无停止判定)";
       const status = [
-        `armed: ${armed === undefined ? `auto(${profile.enabled === true || pi.getFlag("supervise") === true})` : String(armed)}${armed === false && pausedByStop ? "（已自动/手动暂停，/supervisor resume 恢复）" : ""}  ·  session: ${sessionMeta.name || "(未命名)"}  ·  id: ${sessionMeta.id || "?"}`,
+        `状态: ${lifecycle}  ·  armed: ${armed === undefined ? "auto" : String(armed)}  ·  session: ${sessionMeta.name || "(未命名)"}  ·  id: ${sessionMeta.id || "?"}`,
         `judge: ${profile.judgeModel || DEFAULTS.judgeModel} · failOver→${profile.judgeFailover === false ? "(关闭)" : (profile.judgeFailoverModel || DEFAULTS.judgeFailoverModel)} · enforceReadTools=${profile.enforceReadTools === true} · bootstrapTimeout=${Math.round((profile.bootstrapTimeoutMs ?? DEFAULTS.bootstrapTimeoutMs) / 1000)}s · escalation=${profile.escalationAgent || DEFAULTS.escalationAgent}`,
         `iterations: ${iterations}/${profile.maxIterations ?? DEFAULTS.maxIterations}  ·  judge failures: ${judgeFailures}/${profile.maxJudgeFailures ?? DEFAULTS.maxJudgeFailures}`,
         (() => {
