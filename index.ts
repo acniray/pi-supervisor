@@ -30,7 +30,8 @@
  * Arm: /supervisor start | pi --supervise | project profile enabled:true
  */
 
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -41,6 +42,7 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { classifyStopError } from "./quota.ts";
+import { addUsage, emptyUsage, runJudgeOnce, type JudgeAttempt, type JudgeErrorKind, type JudgeResult, type JudgeRunContext, type UsageSummary } from "./judge.ts";
 
 const EXT_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "pi-supervisor");
 const CONFIG_PATH = process.env.PI_SUPERVISOR_CONFIG || process.env.STOP_SUPERVISOR_CONFIG || path.join(EXT_DIR, "config.json");
@@ -53,7 +55,6 @@ const LEGACY_CONTRACT_TYPE = "stop-supervisor-contract";
 const LEGACY_STATE_TYPE = "stop-supervisor-state";
 const BOOTSTRAP_MARKER = "TASK: BOOTSTRAP_CONTRACT";
 const ENFORCE_MARKER = "TASK: ENFORCE_CONTRACT";
-const READONLY_TOOLS = "read,grep,find,ls";
 
 // ---------------------------------------------------------------- types
 
@@ -89,6 +90,8 @@ interface Profile {
   judgeFailoverThinking?: string;
   judgeCommand?: string;
   judgeTimeoutMs?: number;
+  /** Private full-log root; retries always log before spawning the judge. */
+  judgeLogDir?: string;
   /** Bootstrap judge timeout (read-only tools; can take minutes on big repos). */
   bootstrapTimeoutMs?: number;
   maxIterations?: number;
@@ -132,6 +135,25 @@ interface Contract {
 
 type Lifecycle = "inactive" | "drafting" | "active" | "paused" | "cancelled" | "completed";
 
+interface JudgeDiagnosis {
+  at: string;
+  ok: boolean;
+  error?: string;
+  attempts: JudgeAttempt[];
+}
+
+function judgeRecovery(kind?: JudgeErrorKind): string {
+  switch (kind) {
+    case "spawn": return "检查 judgeCommand 是否存在及可执行；处理后 /supervisor retry。";
+    case "logging": return "检查日志目录权限、可用空间及路径；处理后 /supervisor retry。";
+    case "timeout": return "查看最后事件/工具及完整日志，检查耗时或阻塞；必要时由你调整超时后 /supervisor retry。";
+    case "provider": return "查看 provider 原始错误，处理认证、额度或服务问题后 /supervisor retry；不自动替换模型。";
+    case "exit": return "查看 stderr.log 和退出原因；处理子进程错误后 /supervisor retry。";
+    case "invalidated": return "本次已被暂停、取消或会话切换作废；不会应用旧结果。";
+    default: return "查看最终文本和事件流；/supervisor retry 仅重试判官并自动全量留档，不重跑主 Agent。";
+  }
+}
+
 interface Verdict {
   goal_achieved?: boolean;
   criteria_evidence?: Array<{ criterion: string; evidence: string }>;
@@ -149,157 +171,9 @@ interface Verdict {
   compact_focus?: string;
 }
 
-interface JudgeResult {
-  ok: boolean;
-  json?: Record<string, unknown>;
-  text?: string;
-  usage?: UsageSummary;
-  raw?: string;
-  stderr?: string;
-  detail?: string;
-  model?: string;
-  failovers?: string[];
-  error?: string;
-  ms: number;
-}
-
-/** Token/cost usage aggregated across judge turns. */
-interface UsageSummary {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  reasoning: number;
-  totalTokens: number;
-  cost: number;
-  /** Assistant messages observed (a failed provider attempt can produce one with zero usage). */
-  turns: number;
-  /** Judge invocations (one per runJudge call, failover included). */
-  calls: number;
-}
-
-function emptyUsage(): UsageSummary {
-  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 0, cost: 0, turns: 0, calls: 0 };
-}
-
-function addUsage(target: UsageSummary, usage: unknown): void {
-  if (!usage || typeof usage !== "object") return;
-  const u = usage as Record<string, unknown>;
-  const num = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : 0);
-  const cost = u.cost && typeof u.cost === "object" ? num((u.cost as Record<string, unknown>).total) : num(u.cost);
-  const input = num(u.input);
-  const output = num(u.output);
-  const cacheRead = num(u.cacheRead);
-  const cacheWrite = num(u.cacheWrite);
-  target.input += input;
-  target.output += output;
-  target.cacheRead += cacheRead;
-  target.cacheWrite += cacheWrite;
-  target.reasoning += num(u.reasoning);
-  target.totalTokens += num(u.totalTokens) || (input + output + cacheRead + cacheWrite);
-  target.cost += cost;
-  target.turns += 1;
-}
-
 function formatUsage(usage: UsageSummary): string {
   const calls = usage.calls > 0 ? usage.calls : usage.turns;
   return `in ${usage.input} / out ${usage.output} / cacheRead ${usage.cacheRead} / cacheWrite ${usage.cacheWrite} = ${usage.totalTokens} tokens · $${usage.cost.toFixed(4)}（${calls} 次判官调用）`;
-}
-
-/**
- * Judge subprocesses run with `--mode json`, so stdout carries the full event stream
- * (including `usage`). Test stubs may print a plain JSON verdict instead; in that case
- * `sawEvents` is false and the caller falls back to the raw stdout as text.
- */
-interface JudgeOutput {
-  text: string;
-  usage?: UsageSummary;
-  sawEvents: boolean;
-  /** Human-readable diagnosis of why the model produced no usable answer. */
-  detail?: string;
-}
-
-function parseJudgeOutput(stdout: string): JudgeOutput {
-  let sawEvents = false;
-  let finalText = "";
-  let deltaText = "";
-  const usage = emptyUsage();
-  const providerErrors: string[] = [];
-  const stopReasons: string[] = [];
-  const retryErrors: string[] = [];
-  let retryFinalError: string | undefined;
-  let diagnostics: string[] = [];
-
-  const push = (list: string[], value: unknown) => {
-    if (typeof value === "string" && value.trim() && !list.includes(value.trim())) list.push(value.trim());
-  };
-
-  for (const line of stdout.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith("{")) continue;
-    let record: Record<string, unknown>;
-    try {
-      record = JSON.parse(trimmed) as Record<string, unknown>;
-    } catch {
-      continue;
-    }
-    if (record.type === "message_update") {
-      sawEvents = true;
-      const event = record.assistantMessageEvent as Record<string, unknown> | undefined;
-      if (event?.type === "text_delta" && typeof event.delta === "string") deltaText += event.delta;
-    } else if (record.type === "message_end") {
-      const message = record.message as Record<string, unknown> | undefined;
-      if (message?.role === "assistant") {
-        sawEvents = true;
-        addUsage(usage, message.usage);
-        push(stopReasons, message.stopReason);
-        push(providerErrors, message.errorMessage);
-        if (Array.isArray(message.diagnostics)) {
-          for (const item of message.diagnostics as unknown[]) {
-            const text = typeof item === "string" ? item : JSON.stringify(item);
-            if (text) diagnostics.push(text.slice(0, 200));
-          }
-        }
-        const content = message.content;
-        if (Array.isArray(content)) {
-          const text = content
-            .filter((block): block is { type: string; text: string } =>
-              !!block && typeof block === "object" && (block as { type?: string }).type === "text" &&
-              typeof (block as { text?: unknown }).text === "string")
-            .map((block) => block.text)
-            .join("\n");
-          if (text.trim()) finalText = text;
-        }
-      }
-    } else if (record.type === "error") {
-      sawEvents = true;
-      push(providerErrors, record.error);
-      push(providerErrors, record.reason);
-    } else if (record.type === "auto_retry_start") {
-      push(retryErrors, record.errorMessage);
-    } else if (record.type === "auto_retry_end") {
-      if (record.success === false) retryFinalError = typeof record.finalError === "string" ? record.finalError : retryFinalError;
-    }
-  }
-
-  const parts: string[] = [];
-  if (providerErrors.length) parts.push(`provider=${providerErrors.join(" / ")}`);
-  if (retryFinalError) parts.push(`autoRetryFinal=${retryFinalError}`);
-  else if (retryErrors.length) parts.push(`autoRetry=${retryErrors.join(" / ")}`);
-  if (stopReasons.length && stopReasons.some((reason) => reason !== "stop")) {
-    parts.push(`stopReason=${stopReasons.join(",")}`);
-  }
-  if (diagnostics.length) parts.push(`diagnostics=${diagnostics.slice(0, 2).join(" | ")}`);
-  if (!parts.length && usage.turns > 0 && !finalText && !deltaText) {
-    parts.push(`模型返回空内容（${usage.turns} 次 assistant 消息，usage 全为 0，stopReason=${stopReasons.join(",") || "?"}）`);
-  }
-
-  return {
-    text: finalText || deltaText,
-    usage: usage.turns > 0 ? usage : undefined,
-    sawEvents,
-    detail: parts.length ? parts.join("; ") : undefined,
-  };
 }
 
 const QUOTA_WAIT_DEFAULTS = {
@@ -689,150 +563,32 @@ function evaluateVerdict(current: Contract, raw: Verdict): { verdict: Verdict; r
 
 // ---------------------------------------------------------------- judge call
 
-interface RunJudgeOnceOptions {
-  prompt: string;
-  cwd: string;
-  withTools: boolean;
-  model: string;
-  thinking: string;
-  command: string;
-  timeoutMs: number;
-  signal?: AbortSignal;
-}
-
-/** One judge attempt against a specific model. Surfaces provider errors instead of swallowing them. */
-async function runJudgeOnce(options: RunJudgeOnceOptions): Promise<JudgeResult> {
-  const { prompt, cwd, withTools, model, thinking, command, timeoutMs, signal } = options;
-  if (signal?.aborted) return { ok: false, error: "supervision operation invalidated", ms: 0 };
-  const args = [
-    "--mode", "json",
-    "--no-session",
-    "--no-extensions",
-    "--no-skills",
-    "--no-context-files",
-    ...(withTools ? ["--tools", READONLY_TOOLS] : ["--no-tools"]),
-    "--model", model,
-    "--thinking", thinking,
-    prompt,
-  ];
-  const started = Date.now();
-
-  return await new Promise<JudgeResult>((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const finish = (result: Omit<JudgeResult, "ms">) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      resolve({ ...result, model, ms: Date.now() - started });
-    };
-    const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
-    const timer = setTimeout(() => {
-      try { child.kill("SIGKILL"); } catch { /* noop */ }
-      const partial = parseJudgeOutput(stdout);
-      finish({
-        ok: false,
-        error: `judge 超时 ${timeoutMs}ms${partial.detail ? `（${partial.detail}）` : ""}；已收到 ${stdout.length}B 输出`,
-        text: partial.text,
-        usage: partial.usage,
-        detail: partial.detail,
-        raw: stdout.slice(-2000),
-        stderr: stderr.slice(-2000),
-      });
-    }, timeoutMs);
-    const onAbort = () => {
-      // This is our judge subprocess, never the main agent or its run signal.
-      try { child.kill("SIGKILL"); } catch { /* already exited */ }
-      finish({ ok: false, error: "supervision operation invalidated" });
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-    if (signal?.aborted) onAbort();
-    child.stdout?.on("data", (chunk: Buffer) => { stdout = (stdout + chunk.toString()).slice(-120_000); });
-    child.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-20_000); });
-    child.on("error", (error) => finish({ ok: false, error: `judge 进程启动失败: ${String(error)}`, stderr: stderr.slice(-2000) }));
-    child.on("close", (code) => {
-      const output = parseJudgeOutput(stdout);
-      const text = output.sawEvents ? output.text : stdout;
-      if (code !== 0) {
-        const stderrTail = stderr.trim().slice(-800);
-        finish({
-          ok: false,
-          error: `judge 进程退出码 ${code}${output.detail ? `（${output.detail}）` : ""}${stderrTail ? `：${stderrTail}` : ""}`,
-          text,
-          usage: output.usage,
-          detail: output.detail,
-          raw: stdout.slice(-2000),
-          stderr: stderr.slice(-2000),
-        });
-        return;
-      }
-      const parsed = parseJsonObject(text);
-      if (!parsed) {
-        finish({
-          ok: false,
-          error: output.detail
-            ? `judge 未产出可用结果：${output.detail}`
-            : `judge 输出不是 JSON：${text.trim().slice(-500) || "(空)"}`,
-          text,
-          usage: output.usage,
-          detail: output.detail,
-          raw: stdout.slice(-2000),
-          stderr: stderr.slice(-2000),
-        });
-        return;
-      }
-      finish({ ok: true, json: parsed, text, usage: output.usage, detail: output.detail, raw: stdout.slice(-4000), stderr: stderr.slice(-1000) });
-    });
-  });
-}
-
 /**
  * Run the judge, and fail over to a backup model once if the primary attempt produced
  * no usable verdict (provider error, empty output, non-JSON, timeout, non-zero exit).
  */
-async function runJudge(prompt: string, profile: Profile, cwd: string, withTools: boolean, timeoutOverrideMs?: number, signal?: AbortSignal): Promise<JudgeResult> {
+async function runJudge(prompt: string, profile: Profile, cwd: string, withTools: boolean, timeoutOverrideMs?: number, signal?: AbortSignal, context: JudgeRunContext = {}): Promise<JudgeResult> {
   const command = profile.judgeCommand || DEFAULTS.judgeCommand;
   const primary = profile.judgeModel || DEFAULTS.judgeModel;
   const thinking = profile.judgeThinking || DEFAULTS.judgeThinking;
   const timeoutMs = timeoutOverrideMs ?? profile.judgeTimeoutMs ?? DEFAULTS.judgeTimeoutMs;
-  const failovers: string[] = [];
-
-  const base = { prompt, cwd, withTools, command, timeoutMs, signal };
+  const callId = randomUUID();
+  const base = { prompt, cwd, withTools, command, timeoutMs, signal, ...context, callId,
+    logRoot: resolvePath(profile.judgeLogDir || path.join(EXT_DIR, "judge-logs"), cwd) };
   const first = await runJudgeOnce({ ...base, model: primary, thinking });
-  first.failovers = failovers;
-  if (first.ok || signal?.aborted) return first;
+  const fallback = profile.judgeFailover !== false ? profile.judgeFailoverModel : undefined;
+  if (first.ok || signal?.aborted || first.errorKind === "logging" || first.errorKind === "spawn" || !fallback || fallback === primary) return first;
 
-  const failoverEnabled = profile.judgeFailover !== false;
-  const fallback = failoverEnabled ? profile.judgeFailoverModel : undefined;
-  if (!fallback || fallback === primary) return first;
-
-  failovers.push(`${primary} → ${fallback}：主判官失败（${first.error ?? "未知原因"}）`);
-  const second = await runJudgeOnce({
-    ...base,
-    model: fallback,
-    thinking: profile.judgeFailoverThinking || thinking,
-  });
-  second.failovers = failovers;
-  if (second.ok) return second;
-
-  return {
-    ...second,
-    error: `主判官(${primary}) 失败：${first.error ?? "未知"} ｜ 备用判官(${fallback}) 失败：${second.error ?? "未知"}`,
-  };
-}
-function parseJsonObject(raw: string): Record<string, unknown> | undefined {
-  const cleaned = raw.replace(/```(?:json)?/gi, "").trim();
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-  if (start < 0 || end <= start) return undefined;
-  try {
-    const value = JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>;
-    return typeof value === "object" && value !== null ? value : undefined;
-  } catch {
-    return undefined;
-  }
+  const second = await runJudgeOnce({ ...base, model: fallback,
+    thinking: profile.judgeFailoverThinking || thinking, fullLogging: true });
+  const usage = emptyUsage();
+  if (first.usage) addUsage(usage, first.usage);
+  if (second.usage) addUsage(usage, second.usage);
+  const combined: JudgeResult = { ...second, ms: first.ms + second.ms,
+    usage: usage.turns ? usage : undefined, attempts: [...first.attempts || [], ...second.attempts || []],
+    failovers: [`${primary} → ${fallback}：主判官失败（${first.error || "未知原因"}）`] };
+  if (!second.ok) combined.error = `主判官(${primary}) 失败：${first.error || "未知"} ｜ 备用判官(${fallback}) 失败：${second.error || "未知"}`;
+  return combined;
 }
 
 // ---------------------------------------------------------------- prompt builders
@@ -1003,6 +759,7 @@ export default function (pi: ExtensionAPI) {
   }
   let contract: Contract | undefined;
   let lastVerdict: Verdict | undefined;
+  let lastJudge: JudgeDiagnosis | undefined;
   let judging = false;
   let sessionMeta = { id: "", name: "", file: "" };
   let logCtx: { cwd: string; logFile?: string } = { cwd: process.cwd() };
@@ -1011,7 +768,9 @@ export default function (pi: ExtensionAPI) {
   /** Accumulate and log token usage for one judge/compaction call. */
   function recordJudgeUsage(kind: string, result: JudgeResult): void {
     if (result.usage) addUsage(usageTotals, result.usage);
-    usageTotals.calls += 1;
+    usageTotals.calls += result.attempts?.length || 1;
+    lastJudge = { at: new Date().toISOString(), ok: result.ok, error: result.error, attempts: result.attempts || [] };
+    for (const attempt of result.attempts || []) log({ event: "judge-attempt", ...attempt });
     if (result.failovers?.length) {
       log({ event: "judge-failover", kind, model: result.model ?? null, failovers: result.failovers });
     }
@@ -1024,6 +783,8 @@ export default function (pi: ExtensionAPI) {
       usage: result.usage ?? null,
       detail: result.detail ?? null,
       error: result.ok ? null : (result.error ?? null),
+      errorKind: result.errorKind ?? null,
+      attempts: result.attempts ?? [],
       stdoutTail: result.ok ? null : (result.raw ?? null),
       stderrTail: result.ok ? null : (result.stderr ?? null),
     });
@@ -1034,7 +795,7 @@ export default function (pi: ExtensionAPI) {
     try {
       pi.appendEntry(STATE_TYPE, {
         lifecycle, armed: lifecycle === "active", paused: lifecycle === "paused",
-        iterations, judgeFailures, lastVerdict, reason, at: new Date().toISOString(),
+        iterations, judgeFailures, lastVerdict, lastJudge, reason, at: new Date().toISOString(),
       });
     } catch { /* best effort */ }
     refreshStatus();
@@ -1064,6 +825,40 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  function judgeContext(kind: string, retry = false): JudgeRunContext {
+    return { parentSessionId: sessionMeta.id, parentSessionFile: sessionMeta.file,
+      parentSessionName: sessionMeta.name, kind, fullLogging: retry || judgeFailures > 0 };
+  }
+
+  function judgeDiagnosisText(): string {
+    if (!lastJudge) {
+      const old = readSessionHistory(logCtx.logFile, sessionMeta.id, 200).filter(entry => entry.event === "judge-usage").at(-1);
+      if (!old) return "Supervisor：本 session 尚无判官诊断记录；/supervisor retry 可对有效任务全量留档核验。";
+      return [`Supervisor 旧版判官摘要 · ${String(old.ts || "")} · ${String(old.model || "未知模型")}`,
+        truncateMiddle(String(old.error || (old.ok ? "调用成功" : "判官失败")), 1600),
+        "旧版只留摘要/尾部，不能还原主备完整输入输出，也不能据此断言 provider 故障。",
+        "/supervisor retry 只重试判官并自动全量留档；原始历史不能事后补录。"].join("\n");
+    }
+    const rows = lastJudge.attempts.map((attempt, index) => [
+      `${index + 1}. ${attempt.model} · ${attempt.ok ? "成功" : attempt.errorKind || "失败"} · ${attempt.ms}ms`,
+      `   调用 ${attempt.callId} / 尝试 ${attempt.attemptId}`,
+      `   输出 ${attempt.stdoutBytes}B / stderr ${attempt.stderrBytes}B；最后事件 ${attempt.lastEvent || "无"}${attempt.lastTool ? ` / 工具 ${attempt.lastTool}` : ""}`,
+      attempt.error ? `   ${truncateMiddle(attempt.error, 500)}` : "",
+      attempt.logDir ? `   ${attempt.logComplete ? "全量日志" : "日志留档未完成"}：${attempt.logDir}`
+        : attempt.fullLogging ? "   全量日志未能建立，错误见上方。" : "   首轮轻量摘要（无全量原始流，不能事后补录）。",
+      !attempt.ok ? `   ${judgeRecovery(attempt.errorKind)}` : "",
+    ].filter(Boolean).join("\n"));
+    return [`Supervisor 判官诊断 · ${lastJudge.ok ? "最近调用成功" : "最近调用失败，非目标达成"} · ${lastJudge.at}`,
+      ...rows, "恢复入口：/supervisor retry（只核验，不续跑主 Agent）；确认后 /supervisor resume。"].join("\n");
+  }
+
+  function judgeFailureHint(): string {
+    const last = lastJudge?.attempts.at(-1);
+    return [`故障：${last?.errorKind || "判定失败"}。${judgeRecovery(last?.errorKind)}`,
+      last?.logDir ? `全量日志：${last.logDir}` : "重试将自动开启全量日志。",
+      "诊断：/supervisor diagnose；仅重试判官：/supervisor retry。"].join("\n");
+  }
+
   function resolveProfile(cwd: string): Profile {
     const config = readConfig();
     const projects = config.projects || {};
@@ -1082,6 +877,7 @@ export default function (pi: ExtensionAPI) {
     draftPrevious = undefined;
     contract = undefined;
     lastVerdict = undefined;
+    lastJudge = undefined;
     lastAssistantText = "";
     lastErrorMessage = undefined;
     iterations = 0;
@@ -1109,6 +905,8 @@ export default function (pi: ExtensionAPI) {
           iterations = typeof data.iterations === "number" && Number.isFinite(data.iterations) ? Math.max(0, Math.floor(data.iterations)) : 0;
           judgeFailures = typeof data.judgeFailures === "number" && Number.isFinite(data.judgeFailures) ? Math.max(0, Math.floor(data.judgeFailures)) : 0;
           lastVerdict = data.lastVerdict && typeof data.lastVerdict === "object" ? data.lastVerdict as Verdict : undefined;
+          lastJudge = data.lastJudge && typeof data.lastJudge === "object" && Array.isArray((data.lastJudge as JudgeDiagnosis).attempts)
+            ? data.lastJudge as JudgeDiagnosis : undefined;
           if (lifecycle === "cancelled" || lifecycle === "completed") contract = undefined;
         }
       }
@@ -1190,13 +988,13 @@ export default function (pi: ExtensionAPI) {
   async function runBootstrapJudge(profile: Profile, ctx: ExtensionContext, feedback: string, generation: number): Promise<JudgeResult> {
     const prompt = buildBootstrapPrompt(profile, ctx, feedback);
     const signal = operationController.signal;
-    const first = await runJudge(prompt, profile, ctx.cwd, true, profile.bootstrapTimeoutMs ?? DEFAULTS.bootstrapTimeoutMs, signal);
+    const first = await runJudge(prompt, profile, ctx.cwd, true, profile.bootstrapTimeoutMs ?? DEFAULTS.bootstrapTimeoutMs, signal, judgeContext("bootstrap"));
     if (!isCurrent(generation)) return first;
     recordJudgeUsage("bootstrap", first);
-    if (first.ok) return first;
+    if (first.ok || first.errorKind === "spawn" || first.errorKind === "logging") return first;
     log({ event: "bootstrap-retry-no-tools", error: first.error, detail: first.detail, ms: first.ms });
     const second = await runJudge(`${prompt}\n本次无工具，只根据会话推断；不确定的写入 open_questions。`, profile, ctx.cwd, false,
-      Math.min(profile.judgeTimeoutMs ?? DEFAULTS.judgeTimeoutMs, 180_000), signal);
+      Math.min(profile.judgeTimeoutMs ?? DEFAULTS.judgeTimeoutMs, 180_000), signal, judgeContext("bootstrap-retry", true));
     if (isCurrent(generation)) recordJudgeUsage("bootstrap-retry", second);
     return second;
   }
@@ -1433,7 +1231,7 @@ export default function (pi: ExtensionAPI) {
     if (!hasExplicitState && lifecycle === "inactive" && (pi.getFlag("supervise") === true || profile.enabled === true)) {
       if (event.outcome === "aborted" || event.outcome === "error" || ctx.hasPendingMessages() || judging || quotaWaiting) return;
       const built = await ensureContract(ctx, profile);
-      if (!built || lifecycle !== "active") return;
+      if (!built || (lifecycle as Lifecycle) !== "active") return;
       return { continue: true, entries: [{ type: "custom_message", customType: "pi-supervisor", display: true,
         content: buildContinuation({ iteration: iterations + 1, reason: "终点已确认", nextStep: built.next_steps[0] || "核验并推进完成条件", contract: built, showContract: true }) }] };
     }
@@ -1462,19 +1260,19 @@ export default function (pi: ExtensionAPI) {
     try {
       const last = event.context?.contextMessages?.length ? messageText([...event.context.contextMessages].reverse().find(m => m.role === "assistant")) : lastAssistantText;
       const result = await runJudge(buildEnforcePrompt(contract, ctx, last || lastAssistantText, iterations + 1, profile.escalationAgent || DEFAULTS.escalationAgent),
-        profile, ctx.cwd, profile.enforceReadTools === true, undefined, signal);
+        profile, ctx.cwd, profile.enforceReadTools === true, undefined, signal, judgeContext("enforce"));
       if (!isCurrent(generation) || lifecycle !== "active") return;
       recordJudgeUsage("enforce", result);
       if (!result.ok || !result.json) {
         judgeFailures += 1;
-        log({ event: "judge-failure", error: result.error, detail: result.detail, ms: result.ms });
+        log({ event: "judge-failure", error: result.error, errorKind: result.errorKind, detail: result.detail, ms: result.ms });
         persistState("judge failure");
         if (judgeFailures >= (profile.maxJudgeFailures ?? DEFAULTS.maxJudgeFailures)) {
           pauseTask("judge failure limit");
-          return stopBoundary("[Supervisor] 已暂停：判官连续失败，非目标达成。检查配置后 /supervisor resume。");
+          return stopBoundary(`[Supervisor] 已暂停：判官连续失败，非目标达成。\n${judgeFailureHint()}`);
         }
         return { continue: true, entries: [{ type: "custom_message", customType: "pi-supervisor", display: true,
-          content: buildContinuation({ iteration: iterations + 1, reason: "判定失败，不能认定完成", nextStep: contract.next_steps[0] || "核验未完成条件", contract }) }] };
+          content: buildContinuation({ iteration: iterations + 1, reason: "判定失败，不能认定完成；/supervisor diagnose 查看原因，retry 可全量留档只重试判官", nextStep: contract.next_steps[0] || "核验未完成条件", contract }) }] };
       }
       judgeFailures = 0;
       iterations += 1;
@@ -1525,7 +1323,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("supervisor", {
-    description: "Supervisor: start | pause | resume | cancel | status（更多：details/replan/note/judge/history/usage/quota）",
+    description: "Supervisor: start | pause | resume | cancel | status（更多：retry/diagnose/details/replan/note/judge/history/usage/quota）",
     handler: async (args, ctx) => {
       captureSessionMeta(ctx);
       const raw = (args || "").trim();
@@ -1575,6 +1373,7 @@ export default function (pi: ExtensionAPI) {
         lifecycle = "cancelled";
         contract = undefined;
         lastVerdict = undefined;
+        lastJudge = undefined;
         lastErrorMessage = undefined;
         iterations = 0;
         judgeFailures = 0;
@@ -1618,19 +1417,26 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify("Supervisor：补充说明已保留；若改变终点或限制，请 replan 重新确认。", "info");
         return;
       }
-      if (sub === "judge") {
+      if (sub === "judge" || sub === "retry") {
         if (!contract || (lifecycle !== "active" && lifecycle !== "paused")) { ctx.ui.notify("Supervisor：没有有效监督任务；请先 start。", "warning"); return; }
         if (!ctx.isIdle() || judging || quotaWaiting) { ctx.ui.notify("Supervisor：当前忙碌，稍后会自动判定。", "info"); return; }
         const generation = operationGeneration;
         const signal = operationController.signal;
         judging = true;
-        const stopBeat = heartbeat(ctx, "正在手动核验", generation);
+        const retry = sub === "retry";
+        const stopBeat = heartbeat(ctx, retry ? "正在重试判官（全量日志）" : "正在手动核验", generation);
         try {
           const result = await runJudge(buildEnforcePrompt(contract, ctx, lastAssistantText, iterations + 1, profile.escalationAgent || DEFAULTS.escalationAgent),
-            profile, ctx.cwd, profile.enforceReadTools === true, undefined, signal);
+            profile, ctx.cwd, profile.enforceReadTools === true, undefined, signal, judgeContext(retry ? "manual-retry" : "manual", retry));
           if (!isCurrent(generation) || !contract || (lifecycle !== "active" && lifecycle !== "paused")) return;
-          recordJudgeUsage("manual", result);
-          if (!result.ok || !result.json) { ctx.ui.notify("Supervisor：手动判定失败，状态不变。", "warning"); return; }
+          recordJudgeUsage(retry ? "manual-retry" : "manual", result);
+          if (!result.ok || !result.json) {
+            if (retry) judgeFailures += 1;
+            if (retry && lifecycle === "active" && judgeFailures >= (profile.maxJudgeFailures ?? DEFAULTS.maxJudgeFailures)) pauseTask("judge failure limit");
+            else persistState(retry ? "manual retry failed" : "manual judge failed");
+            ctx.ui.notify(`Supervisor：判官核验失败，未续跑主 Agent。\n${judgeFailureHint()}`, "warning"); return;
+          }
+          judgeFailures = 0;
           const wasActive = lifecycle === "active";
           const { verdict, replan } = interpretVerdict(result.json as Verdict, ctx);
           log({ event: "manual-judge", verdict, ms: result.ms });
@@ -1639,11 +1445,15 @@ export default function (pi: ExtensionAPI) {
             for (const entry of boundary.entries || []) {
               if (entry.type === "custom_message") pi.sendMessage({ customType: "pi-supervisor-stop", content: entry.content, display: true }, { triggerTurn: false });
             }
-          } else if (wasActive && lifecycle === "active" && !ctx.hasPendingMessages()) {
+          } else if (!retry && wasActive && lifecycle === "active" && !ctx.hasPendingMessages()) {
             pi.sendUserMessage(buildContinuation({ iteration: iterations + 1, reason: verdict.reason || "终点尚未验证", nextStep: verdict.next_step || contract!.next_steps[0] || "核验完成条件", contract: contract!,
               unmet: asStringArray(verdict.unmet_conditions), violations: asStringArray(verdict.policy_violations), missingRecords: asStringArray(verdict.records_missing) }));
-          } else ctx.ui.notify("Supervisor：已判定，仍保持暂停；未发送续跑指令。", "info");
+          } else ctx.ui.notify(`Supervisor：已判定，${lifecycle === "paused" ? "仍保持暂停" : "保持监督状态"}；未发送主 Agent 续跑指令。${retry ? "全量日志见 /supervisor diagnose。" : ""}`, "info");
         } finally { if (isCurrent(generation)) judging = false; stopBeat(); }
+        return;
+      }
+      if (sub === "diagnose") {
+        ctx.ui.notify(judgeDiagnosisText(), lastJudge?.ok === false ? "warning" : "info");
         return;
       }
       if (sub === "quota") {
@@ -1680,7 +1490,7 @@ export default function (pi: ExtensionAPI) {
           .filter((entry) => entry.event === "judge-usage" && entry.usage);
         const sessionUsage = emptyUsage();
         for (const entry of logged) addUsage(sessionUsage, entry.usage);
-        sessionUsage.calls = logged.length;
+        sessionUsage.calls = logged.reduce((total, entry) => total + (Array.isArray(entry.attempts) ? entry.attempts.length || 1 : 1), 0);
         const recent = logged.slice(-8);
         const text = [
           `本进程: ${formatUsage(usageTotals)}`,
@@ -1698,17 +1508,18 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (sub !== "status") {
-        ctx.ui.notify("用法：/supervisor start | pause | resume | cancel | status\n更多：details/replan/note/judge/history/usage/quota", "info");
+        ctx.ui.notify("用法：/supervisor start | pause | resume | cancel | status\n更多：retry/diagnose/details/replan/note/judge/history/usage/quota", "info");
         return;
       }
-      const next = lifecycle === "active" ? "pause / cancel" : lifecycle === "paused" && contract ? "resume / cancel" : lifecycle === "drafting" ? "确认终点 / cancel" : "start";
+      const next = lifecycle === "active" ? "pause / cancel" : lifecycle === "paused" && contract ? `${lastJudge?.ok === false ? "retry / " : ""}resume / cancel` : lifecycle === "drafting" ? "确认终点 / cancel" : "start";
       const status = [
         `Supervisor · ${stateLabel()}`,
         contract ? `终点：${truncateMiddle(contract.mission, 160)}` : "当前无有效契约。",
         lastVerdict?.goal_achieved === false ? `未闭环：${truncateMiddle(asStringArray(lastVerdict.unmet_conditions).join("；") || lastVerdict.reason || "尚待核验", 180)}` : "",
         contract && lastVerdict?.next_step ? `下一步：${truncateMiddle(lastVerdict.next_step, 180)}` : "",
         `操作：/supervisor ${next}`,
-        "详情：details · 诊断：history / usage / quota",
+        lastJudge?.ok === false ? "判官故障：/supervisor diagnose；/supervisor retry 只重试判官并全量留档。" : "",
+        "详情：details · 诊断：diagnose / history / usage / quota",
       ].filter(Boolean).join("\n");
       ctx.ui.notify(status, "info");
 

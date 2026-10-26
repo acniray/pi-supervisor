@@ -16,6 +16,7 @@
     "judgeFailoverModel": "<provider>/<fallback-model>",
     "stopFile": "~/.pi/agent/extensions/pi-supervisor/STOP",
     "logFile": "verdicts.jsonl",
+    "judgeLogDir": "~/.pi/agent/extensions/pi-supervisor/judge-logs",
     "quotaWait": {
       "enabled": true,
       "intervalMs": 600000,

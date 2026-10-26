@@ -22,7 +22,14 @@ function check() {
   if (done || !fs.existsSync(response)) return;
   let value; try { value = JSON.parse(fs.readFileSync(response, 'utf8')); } catch { return; }
   done = true; watcher.close();
-  console.log(value.raw === undefined ? JSON.stringify(value) : value.raw);
+  const output = value.raw === undefined ? JSON.stringify(value) : value.raw;
+  const sessionIndex = process.argv.indexOf('--session');
+  if (sessionIndex >= 0) {
+    const sessionPath = process.argv[sessionIndex + 1];
+    fs.writeFileSync(sessionPath, JSON.stringify({type:'session',version:3,id:'fixture-session',cwd:process.cwd()}) + '\\n' + JSON.stringify({type:'message',message:{role:'assistant',content:[{type:'text',text:output}]}}) + '\\n', {mode:0o600});
+  }
+  if (value.stderr) fs.writeSync(2, value.stderr);
+  fs.writeSync(1, output + (value.noFinalNewline ? '' : '\\n'));
   process.exitCode = value.code || 0;
 }
 fs.writeFileSync('call-' + count + '.json', JSON.stringify(process.argv.slice(2)));
@@ -32,6 +39,7 @@ const config: any = { defaults: {
   judgeCommand: judgePath, judgeModel: "fixture/primary", judgeFailover: false,
   judgeTimeoutMs: 2000, bootstrapTimeoutMs: 2000,
   logFile: path.join(root, "verdicts.jsonl"), stopFile: path.join(root, "STOP"),
+  judgeLogDir: path.join(root, "judge-logs"),
 }, projects: {} };
 fs.writeFileSync(configPath, JSON.stringify(config));
 const { default: extension } = await import("./index.ts");
@@ -127,6 +135,8 @@ async function harness(options: any = {}) {
     reply(id: number, value: any) { fs.writeFileSync(path.join(cwd, `reply-${id}.json`), JSON.stringify(value)); },
     waitCall: (id: number) => waitFile(path.join(cwd, `call-${id}.json`)),
     callCount: () => Number(fs.existsSync(path.join(cwd, "judge-count")) ? fs.readFileSync(path.join(cwd, "judge-count"), "utf8") : 0),
+    callArgs: (id: number) => JSON.parse(fs.readFileSync(path.join(cwd, `call-${id}.json`), "utf8")),
+    audit: () => fs.existsSync(config.defaults.logFile) ? fs.readFileSync(config.defaults.logFile, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(row => row.sessionId === sessionId) : [],
     settle: (outcome = "completed") => event("agent_before_settle", { outcome, context: { pendingMessages: [], contextMessages: [], contextEntries: [] } }),
     async status(details = false) { await command(details ? "details" : "status"); return notifications.at(-1)!; },
     async switchSession(next: any[] = []) { entries = structuredClone(next); sessionId = "another-session"; await event("session_start"); },
@@ -403,3 +413,223 @@ test("confirmation/status are short, retained constraints stay in details, ordin
   assert.ok(text.length < 800);
   assert.ok(h.statuses.at(-1)?.includes("监督中"));
 });
+
+// These exercise the real subprocess boundary; only the external judge is a fixture.
+function judgeEvents(verdict: any, noiseSize = 180_000): string {
+  const assistant = { role: "assistant", content: [{ type: "text", text: JSON.stringify(verdict) }],
+    usage: { input: 10, output: 20, totalTokens: 30 }, stopReason: "stop" };
+  const tool = { role: "toolResult", toolName: "read", toolCallId: "large-read",
+    content: [{ type: "text", text: "工具原件🙂".repeat(Math.ceil(noiseSize / 6)) }], isError: false };
+  return [
+    { type: "message_end", message: assistant },
+    { type: "agent_end", messages: [tool, assistant], willRetry: false },
+    { type: "agent_settled", aborted: false },
+  ].map(row => JSON.stringify(row)).join("\n");
+}
+
+test("large agent_end cannot evict a valid final judgement", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  h.enqueue({ raw: judgeEvents(success()) });
+  await h.settle();
+  assert.equal(h.state.lifecycle, "completed");
+  assert.equal(h.callCount(), 1);
+});
+
+test("failover logs the complete retry privately and preserves both attempts", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")],
+    profile: { judgeFailover: true, judgeFailoverModel: "fixture/backup" } });
+  const raw = judgeEvents(success());
+  h.enqueue({ raw: JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "not a JSON verdict" }], stopReason: "stop", usage: { input: 4, output: 6, totalTokens: 10 } } }) });
+  const stderr = "retry diagnostic\n".repeat(2000);
+  h.enqueue({ raw, stderr });
+  await h.settle();
+  assert.equal(h.state.lifecycle, "completed");
+  const attempts = h.audit().filter(row => row.event === "judge-attempt");
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0].fullLogging, false);
+  assert.equal(attempts[0].errorKind, "parse");
+  assert.equal(attempts[0].model, "fixture/primary");
+  assert.equal(attempts[1].fullLogging, true);
+  assert.equal(attempts[1].logComplete, true);
+  assert.equal(attempts[1].model, "fixture/backup");
+  assert.equal(attempts[0].callId, attempts[1].callId);
+  assert.notEqual(attempts[0].attemptId, attempts[1].attemptId);
+  assert.equal(h.callArgs(1).includes("--no-session"), true);
+  const dir = attempts[1].logDir;
+  assert.equal(fs.readFileSync(path.join(dir, "stdout.jsonl"), "utf8"), raw + "\n");
+  assert.equal(fs.readFileSync(path.join(dir, "stderr.log"), "utf8"), stderr);
+  const request = JSON.parse(fs.readFileSync(path.join(dir, "request.json"), "utf8"));
+  assert.equal(request.parentSessionId, path.basename(h.cwd));
+  assert.match(request.prompt, /TASK: ENFORCE_CONTRACT/);
+  const args = h.callArgs(2);
+  assert.equal(args[args.indexOf("--session") + 1], path.join(dir, "session.jsonl"));
+  assert.equal(args.includes("--no-session"), false);
+  assert.ok(fs.existsSync(path.join(dir, "session.jsonl")));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "result.json"), "utf8")).ok, true);
+  assert.equal(fs.readFileSync(path.join(dir, "text.txt"), "utf8"), JSON.stringify(success()));
+  if (process.platform !== "win32") {
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+    for (const file of ["request.json", "stdout.jsonl", "stderr.log", "text.txt", "result.json", "session.jsonl"])
+      assert.equal(fs.statSync(path.join(dir, file)).mode & 0o777, 0o600);
+  }
+  const usage = h.audit().find(row => row.event === "judge-usage");
+  assert.equal(usage.ms, attempts[0].ms + attempts[1].ms);
+  assert.equal(usage.usage.totalTokens, 40);
+});
+
+test("the next enforcement after failure enables full logs before it starts", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  h.enqueue({ raw: "bad first answer" }); await h.settle();
+  assert.equal(h.state.judgeFailures, 1);
+  h.enqueue(success()); await h.settle();
+  const attempts = h.audit().filter(row => row.event === "judge-attempt");
+  assert.equal(attempts.length, 2);
+  assert.equal(attempts[0].fullLogging, false);
+  assert.equal(attempts[1].fullLogging, true);
+  assert.equal(h.callArgs(2).includes("--session"), true);
+});
+
+for (const lifecycle of ["paused", "active"]) {
+  test(`retry only judges while ${lifecycle}, clearing failures without running the main agent`, async () => {
+    const h = await harness({ entries: [contractEntry(), stateEntry(lifecycle, { iterations: 7, judgeFailures: 2 })] });
+    h.enqueue({ goal_achieved: false, reason: "仍缺证据", next_step: "补证" });
+    await h.command("retry");
+    assert.equal(h.callCount(), 1);
+    assert.equal(h.state.lifecycle, lifecycle);
+    assert.equal(h.state.iterations, 7);
+    assert.equal(h.state.judgeFailures, 0);
+    assert.equal(h.sends.filter(s => s.triggerTurn).length, 0);
+    assert.equal(h.callArgs(1).includes("--session"), true);
+  });
+}
+
+test("failed retry while active honors the existing consecutive-failure pause limit", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active", { judgeFailures: 1 })], profile: { maxJudgeFailures: 2 } });
+  h.enqueue({ raw: "bad retry" }); await h.command("retry");
+  assert.equal(h.state.lifecycle, "paused");
+  assert.equal(h.state.judgeFailures, 2);
+  assert.equal(h.sends.length, 0);
+});
+
+test("log finalization failure rejects a valid verdict instead of claiming full logging succeeded", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("paused")] });
+  const id = h.enqueue(); const pending = h.command("retry"); await h.waitCall(id);
+  const args = h.callArgs(id);
+  const dir = path.dirname(args[args.indexOf("--session") + 1]);
+  fs.mkdirSync(path.join(dir, "text.txt"));
+  h.reply(id, success()); await pending;
+  assert.equal(h.state.lifecycle, "paused");
+  assert.equal(h.state.lastJudge.attempts[0].errorKind, "logging");
+  assert.equal(h.state.lastJudge.attempts[0].logComplete, false);
+  assert.equal(h.sends.length, 0);
+});
+
+test("diagnose can read legacy audit errors after reload without inventing full logs", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("paused", { judgeFailures: 2 })] });
+  fs.appendFileSync(config.defaults.logFile, JSON.stringify({ event: "judge-usage", sessionId: path.basename(h.cwd),
+    ts: "2026-10-26T05:28:47.806Z", ok: false, model: "fixture/old-judge", error: "legacy judge 输出不是 JSON", stdoutTail: "old tail only" }) + "\n");
+  await h.command("diagnose");
+  assert.match(h.notifications.at(-1)!, /legacy judge 输出不是 JSON/);
+  assert.match(h.notifications.at(-1)!, /旧版|摘要/);
+  assert.match(h.notifications.at(-1)!, /retry/);
+  assert.equal(h.callCount(), 0);
+});
+
+test("failed retry retains a classified diagnosis and failure count across reload", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("paused", { judgeFailures: 2 })] });
+  h.enqueue({ raw: "bad retry" }); await h.command("retry");
+  assert.equal(h.callCount(), 1);
+  assert.equal(h.state.lifecycle, "paused");
+  assert.equal(h.state.judgeFailures, 3);
+  assert.equal(h.state.lastJudge.attempts[0].errorKind, "parse");
+  const dir = h.state.lastJudge.attempts[0].logDir;
+  await h.event("session_start");
+  await h.command("diagnose");
+  assert.match(h.notifications.at(-1)!, /parse/);
+  assert.ok(h.notifications.at(-1)!.includes(dir));
+  assert.match(h.notifications.at(-1)!, /retry/);
+  assert.equal(h.callCount(), 1);
+  assert.equal(h.sends.length, 0);
+});
+
+for (const action of ["cancel", "switch-session", "resume", "pause"]) {
+  test(`${action} discards an in-flight diagnostic retry without aborting the main agent`, async () => {
+    const h = await harness({ entries: [contractEntry(), stateEntry(action === "pause" ? "active" : "paused", { judgeFailures: 2 })] });
+    const id = h.enqueue(); const pending = h.command("retry");
+    await h.waitCall(id);
+    if (action === "cancel") { h.select = "取消"; await h.command("cancel"); }
+    else if (action === "switch-session") await h.switchSession();
+    else await h.command(action);
+    const before = structuredClone(h.entries);
+    const sendsBefore = h.sends.length;
+    h.reply(id, success()); await pending;
+    assert.deepEqual(h.entries, before);
+    assert.equal(h.sends.length, sendsBefore);
+    assert.equal(h.aborts, 0);
+    const args = h.callArgs(id);
+    const file = args[args.indexOf("--session") + 1];
+    const saved = JSON.parse(fs.readFileSync(path.join(path.dirname(file), "result.json"), "utf8"));
+    assert.equal(saved.errorKind, "invalidated");
+  });
+}
+
+test("retry completion still requires criterion evidence and never starts the main agent", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("paused")] });
+  h.enqueue({ goal_achieved: true, reason: "不能自报完成" }); await h.command("retry");
+  assert.equal(h.state.lifecycle, "paused");
+  h.enqueue(success()); await h.command("retry");
+  assert.equal(h.state.lifecycle, "completed");
+  assert.equal(h.sends.filter(s => s.triggerTurn).length, 0);
+});
+
+test("spawn failure is diagnosed without retrying the same missing command on a backup model", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("paused")],
+    profile: { judgeCommand: path.join(root, "missing-judge"), judgeFailover: true, judgeFailoverModel: "fixture/backup" } });
+  await h.command("retry");
+  assert.equal(h.state.lastJudge.attempts.length, 1);
+  assert.equal(h.state.lastJudge.attempts[0].errorKind, "spawn");
+  assert.match(h.notifications.at(-1)!, /judgeCommand/);
+  assert.equal(h.sends.length, 0);
+});
+
+test("timeout diagnostics retain complete output and never report completion", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("paused")], profile: { judgeTimeoutMs: 300 } });
+  const id = h.enqueue(); const pending = h.command("retry"); await h.waitCall(id); await pending;
+  assert.equal(h.state.lifecycle, "paused");
+  assert.equal(h.state.lastJudge.attempts[0].errorKind, "timeout");
+  const dir = h.state.lastJudge.attempts[0].logDir;
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "result.json"), "utf8")).errorKind, "timeout");
+  assert.ok(fs.existsSync(path.join(dir, "stdout.jsonl")));
+  assert.equal(h.sends.length, 0);
+});
+
+test("unwritable full-log location fails explicitly before launching a paid retry", async () => {
+  const blocked = path.join(root, "not-a-log-directory"); fs.writeFileSync(blocked, "file");
+  const h = await harness({ entries: [contractEntry(), stateEntry("paused")], profile: { judgeLogDir: blocked } });
+  await h.command("retry");
+  assert.equal(h.callCount(), 0);
+  assert.equal(h.state.lastJudge.attempts[0].errorKind, "logging");
+  assert.match(h.notifications.at(-1)!, /日志|logging/);
+  assert.equal(h.state.lifecycle, "paused");
+});
+
+test("a final assistant errorMessage blocks completion even when stopReason says stop", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  h.enqueue({ raw: JSON.stringify({ type: "message_end", message: { role: "assistant",
+    content: [{ type: "text", text: JSON.stringify(success()) }], stopReason: "stop", errorMessage: "fixture final provider failure" } }) });
+  await h.settle();
+  assert.notEqual(h.state.lifecycle, "completed");
+  assert.equal(h.state.judgeFailures, 1);
+  assert.equal(h.state.lastJudge.attempts[0].errorKind, "provider");
+});
+
+for (const stopReason of ["toolUse", "error"]) {
+  test(`a ${stopReason} assistant cannot pass as a completed JSON verdict`, async () => {
+    const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+    h.enqueue({ raw: JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: JSON.stringify(success()) }], stopReason,
+      ...(stopReason === "error" ? { errorMessage: "fixture provider error" } : {}) } }) });
+    await h.settle();
+    assert.notEqual(h.state.lifecycle, "completed");
+    assert.equal(h.state.judgeFailures, 1);
+  });
+}

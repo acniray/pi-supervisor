@@ -15,13 +15,13 @@ cp config.example.json config.json
 $EDITOR config.json  # 填写自己的 judgeModel / judgeFailoverModel
 ```
 
-无第三方依赖、无需构建，pi 直接加载 `index.ts`。测试需要 Node ≥ 22.6：
+无第三方依赖、无需构建，pi 直接加载 `index.ts`（同目录需保留 `judge.ts`、`quota.ts`）。测试需要 Node ≥ 22.6：
 
 ```bash
 node --test *.test.ts
 ```
 
-`config.json` 和 `verdicts.jsonl` 已被 gitignore：前者含本机配置，后者含任务契约、判定及错误文本，不应提交或公开。
+`config.json`、`verdicts.jsonl` 和 `judge-logs/` 已被 gitignore：包含本机配置、任务内容、判官输入输出及错误，不应提交或公开。
 
 > `DEFAULTS` 中的模型与 agent 名称是作者本机取值，不保证在你的环境可用。请在 `config.json` 中覆盖。
 
@@ -85,6 +85,8 @@ node --test *.test.ts
 /supervisor note <说明>      # 追加用户说明，不触发重新推断
 /supervisor details          # 完整有效契约：进度、规则、说明等
 /supervisor judge            # 空闲时手动核验；暂停中不会因此自动续跑
+/supervisor retry            # 只重试判官，自动开启全量日志；不触发主 Agent 续跑
+/supervisor diagnose         # 当前 session 最近主备尝试、错误原因、日志路径和恢复建议
 /supervisor history [n]      # 当前 session 的判定历史，默认 20 条
 /supervisor usage            # 判官 token / 缓存 / 金额及最近调用
 /supervisor quota            # 主模型额度等待的配置、状态和错误分类
@@ -140,6 +142,7 @@ touch ~/.pi/agent/extensions/pi-supervisor/STOP
       "escalationAgent": "escalation", // 可用的升级诊断 agent，不是每个任务的强制步骤
       "stopFile": "~/.pi/agent/extensions/pi-supervisor/STOP",
       "logFile": "verdicts.jsonl",
+      "judgeLogDir": "~/.pi/agent/extensions/pi-supervisor/judge-logs",
       "goal": null,                  // 可选的固定目标提示，仍需形成明确终点
       "quotaWait": {
         "enabled": true,
@@ -159,7 +162,7 @@ touch ~/.pi/agent/extensions/pi-supervisor/STOP
 
 ### 判官、失败与证据
 
-判官是独立 `pi --mode json --no-session --no-extensions --no-skills --no-context-files` 子进程，不加载本扩展：
+判官是独立 `pi --mode json --no-extensions --no-skills --no-context-files` 子进程，不加载本扩展。首轮轻量调用使用 `--no-session`，重试则使用独立的 `--session <日志目录>/session.jsonl`：
 
 - 推断阶段可用只读工具，主要依据当前会话；只核对明确提及的关键事实，不默认扫描仓库。
 - 正常核验默认无工具；需要判官自行查证时可设置 `enforceReadTools: true`，会增加耗时。
@@ -169,13 +172,54 @@ touch ~/.pi/agent/extensions/pi-supervisor/STOP
 
 主判官出现 provider 错误、空输出、非 JSON、超时或非零退出时，可用备用模型重试一次。推断阶段还会尝试一次无工具推断；仍失败就保留原状态，不建立新契约。
 
-正常核验失败不等于完成：未到连续失败上限时按现有契约继续核验，达到上限则暂停。手动 `judge` 失败不改变状态。错误详情、主备切换及输出尾部写入审计日志。
+正常核验失败不等于完成：未到连续失败上限时按现有契约继续核验，达到上限则暂停。手动 `judge` 失败不改变启停状态；显式 `retry` 失败会计入连续失败次数，并遵守原暂停上限。有效判定成功后清零连续失败次数，不能据此认定目标完成。
+
+JSONL 按 LF 增量解析并正确处理跨块 UTF-8；最终判定与诊断尾缓存分离，不会再被大量工具输出或最后的 `agent_end` 消息汇总挤掉。只有完成的最终 assistant 消息可进入现有证据闸门；`toolUse`、中断、provider 错误和未完成流中的 JSON 不能冒充最终判定。每个协议记录的解析上限为 4,000,000 个 UTF-16 码元（含边界值），超大记录丢弃至下个 LF，不把残片重新当 JSON；全量原始日志不受该解析上限截断。
+
+### 重试默认全量日志
+
+默认**首轮轻量，重试自动全量**，不需要修改现有配置：
+- 主判官失败后的备用模型尝试；
+- 推断失败后的无工具重试；
+- 连续判定失败后的下一次核验（包括 resume 后）；
+- 显式 `/supervisor retry`。
+
+每个主/备尝试有独立 attempt ID，同一组主备共享 call ID，并关联主 session。全量记录在子进程启动前建立，字节流直接落盘，不以尾缓存冒充完整日志：
+
+```text
+~/.pi/agent/extensions/pi-supervisor/judge-logs/<时间>-<attempt-id>/
+  request.json    # 实际提示词、模型、工具/超时设置、主 session 关联
+  session.jsonl   # 原生判官会话：含系统提示/工具声明及消息
+  stdout.jsonl    # 完整 stdout 字节流
+  stderr.log     # 完整 stderr 字节流
+  text.txt       # 提取的最终或部分 assistant 文本
+  result.json    # 判定、usage、退出原因、完整性与错误分类
+```
+
+可用 `judgeLogDir` 改变目录。每次尝试的目录权限为 0700、文件为 0600；仅本地保存，不额外采集环境变量或认证文件。但提示词和读文件结果可能包含敏感内容，请勿公开这些原始日志。默认不自动删除证据，排查结束后可自行清理尝试目录。
+
+超时、取消和进程错误也会尽可能关闭日志、记录终态；日志路径无法建立时在启动判官前报 `logging`，写入失败时明确标注未完成，不能假称全量日志成功。首次轻量调用的旧内容无法事后补录。
+
+### 故障处理与仅重试判官
+
+`diagnose` 区分 `spawn / timeout / exit / provider / parse / incomplete / logging / invalidated`，显示每次尝试的模型、耗时、实际输出总字节、最后事件/工具、日志路径和处理建议。不能仅凭流片段中的 usage/stopReason 认定 provider 故障。主备均失败仍保留两者记录；usage 和耗时统计包括主备两次尝试。
+
+```text
+/supervisor diagnose   # 看具体原因；旧版 session 则回读已有审计摘要，不虚构完整日志
+/supervisor retry      # 仅重新核验已有契约，默认全量留档
+/supervisor diagnose   # 查看本次重试的原件及结果
+/supervisor resume     # 确认后另行恢复主 Agent 的推进
+```
+
+`retry` 只在空闲且有 active/paused 有效契约时执行；不重新运行主 Agent 的业务任务、不自动换模型、不改配置、不追加无限重试。暂停任务若未达成仍保持暂停；若证据确实闭环则正常完成，仍沿用逐条件证据闸门。主 Agent 忙碌时不会并发启动判官。暂停、取消、resume 或会话切换会使旧尝试失效，不能让迟到结果覆盖当前任务。
+
+更新扩展文件后，当前会话需执行 `/reload` 才加载新实现。
 
 ### 可见性与历史
 
 状态栏保留当前主状态，推断/核验时附带已用时间，额度等待时显示倒计时。候选确认、放弃、暂停、取消、完成均有明确反馈。
 
-`verdicts.jsonl` 记录推断、契约、判定、完成、取消、失败及额度事件，并附 `sessionId` / `sessionName` / `sessionFile`，方便区分同一目录下的不同会话。`history`、`usage` 按当前 session 查询。
+`verdicts.jsonl` 记录推断、契约、判定、完成、取消、失败、逐次判官尝试及额度事件，并附 `sessionId` / `sessionName` / `sessionFile`，方便区分同一目录下的不同会话。最近诊断概要也写入会话的监督状态，重载后仍可查看。`history`、`usage`、`diagnose` 按当前 session 查询。
 
 `usage` 统计判官调用（bootstrap / enforce / manual / retry），不包含主 Agent 自身 token，也不包含注入监督消息给主会话造成的间接开销；供应商未返回 usage 时不会估算成真实消耗。
 

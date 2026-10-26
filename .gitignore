@@ -3,6 +3,7 @@
 # `verdicts.jsonl` holds every judge verdict, contract and error text from your sessions.
 config.json
 verdicts.jsonl
+judge-logs/
 
 # Soft-stop switch (touch this file to make the supervisor yield)
 STOP
