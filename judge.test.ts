@@ -84,3 +84,31 @@ test("plain and fenced JSON remain supported for external judge commands", () =>
     assert.deepEqual(parseJsonObject(output.text), { goal_achieved: false });
   }
 });
+
+import * as fsx from "node:fs";
+import * as osx from "node:os";
+import * as pathx from "node:path";
+import { resolveJudgeExtension } from "./judge.ts";
+
+test("resolves npm: provider packages from the agent npm directory only", () => {
+  const dir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), "judge-ext-"));
+  try {
+    const pkg = pathx.join(dir, "npm", "node_modules", "pi-provider-qoder");
+    fsx.mkdirSync(pathx.join(pkg, "dist"), { recursive: true });
+    fsx.writeFileSync(pathx.join(pkg, "package.json"), JSON.stringify({ name: "pi-provider-qoder", pi: { extensions: ["./dist/index.js"] } }));
+    fsx.writeFileSync(pathx.join(pkg, "dist", "index.js"), "export default () => {}");
+    assert.equal(resolveJudgeExtension("npm:pi-provider-qoder", dir, dir), pkg);
+    assert.throws(() => resolveJudgeExtension("npm:missing-pkg", dir, dir), /找不到/);
+    assert.throws(() => resolveJudgeExtension("npm:../escape", dir, dir), /包名无效/);
+  } finally { fsx.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("resolves explicit paths and rejects builtins or nonexistent entries", () => {
+  const dir = fsx.mkdtempSync(pathx.join(osx.tmpdir(), "judge-ext-path-"));
+  try {
+    const file = pathx.join(dir, "provider.ts"); fsx.writeFileSync(file, "export default () => {}");
+    assert.equal(resolveJudgeExtension(file, dir, dir), file);
+    assert.throws(() => resolveJudgeExtension("builtin:mcp", dir, dir), /builtin/);
+    assert.throws(() => resolveJudgeExtension(pathx.join(dir, "nope.js"), dir, dir), /不存在/);
+  } finally { fsx.rmSync(dir, { recursive: true, force: true }); }
+});

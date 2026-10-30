@@ -15,6 +15,14 @@ fs.writeFileSync(judgePath, `#!/usr/bin/env node
 const fs = require('node:fs');
 const count = Number(fs.existsSync('judge-count') ? fs.readFileSync('judge-count', 'utf8') : 0) + 1;
 fs.writeFileSync('judge-count', String(count));
+const sessionIndex = process.argv.indexOf('--session');
+const sessionPath = sessionIndex >= 0 ? process.argv[sessionIndex + 1] : undefined;
+let history = [];
+if (sessionPath) history = fs.readFileSync(sessionPath, 'utf8').split('\\n').filter(Boolean).map(line => {try{return JSON.parse(line)}catch{return null}}).filter(Boolean);
+fs.writeFileSync('context-' + count + '.json', JSON.stringify(history));
+const last = history.filter(e => e.type !== 'session').at(-1);
+const userId = 'fixture-user-' + count;
+if (sessionPath) fs.appendFileSync(sessionPath, JSON.stringify({type:'message',id:userId,parentId:last?.id || null,timestamp:new Date().toISOString(),message:{role:'user',content:[{type:'text',text:process.argv.at(-1)}]}}) + '\\n');
 const response = 'reply-' + count + '.json';
 let done = false;
 const watcher = fs.watch('.', check);
@@ -23,10 +31,8 @@ function check() {
   let value; try { value = JSON.parse(fs.readFileSync(response, 'utf8')); } catch { return; }
   done = true; watcher.close();
   const output = value.raw === undefined ? JSON.stringify(value) : value.raw;
-  const sessionIndex = process.argv.indexOf('--session');
-  if (sessionIndex >= 0) {
-    const sessionPath = process.argv[sessionIndex + 1];
-    fs.writeFileSync(sessionPath, JSON.stringify({type:'session',version:3,id:'fixture-session',cwd:process.cwd()}) + '\\n' + JSON.stringify({type:'message',message:{role:'assistant',content:[{type:'text',text:output}]}}) + '\\n', {mode:0o600});
+  if (sessionPath) {
+    fs.appendFileSync(sessionPath, JSON.stringify({type:'message',id:'fixture-assistant-' + count,parentId:userId,timestamp:new Date().toISOString(),message:{role:'assistant',stopReason:'stop',content:[{type:'text',text:output}]}}) + '\\n');
   }
   if (value.stderr) fs.writeSync(2, value.stderr);
   fs.writeSync(1, output + (value.noFinalNewline ? '' : '\\n'));
@@ -40,6 +46,7 @@ const config: any = { defaults: {
   judgeTimeoutMs: 2000, bootstrapTimeoutMs: 2000,
   logFile: path.join(root, "verdicts.jsonl"), stopFile: path.join(root, "STOP"),
   judgeLogDir: path.join(root, "judge-logs"),
+  judgeSessionDir: path.join(root, "judge-sessions"),
 }, projects: {} };
 fs.writeFileSync(configPath, JSON.stringify(config));
 const { default: extension } = await import("./index.ts");
@@ -112,7 +119,12 @@ async function harness(options: any = {}) {
       confirm: async () => false, input: async () => undefined,
     },
   };
+  const bus = new Map<string, Set<Function>>();
   const pi: any = {
+    events: {
+      on: (name: string, callback: Function) => { const set = bus.get(name) || new Set(); set.add(callback); bus.set(name, set); return () => set.delete(callback); },
+      emit: (name: string, payload: any) => { for (const callback of bus.get(name) || []) callback(payload); },
+    },
     on: (name: string, callback: Function) => events.set(name, callback),
     registerFlag: () => {}, getFlag: () => options.flag === true,
     registerCommand: (name: string, command: any) => commands.set(name, command),
@@ -131,15 +143,29 @@ async function harness(options: any = {}) {
     get state() { return entries.filter(e => e.customType === "pi-supervisor-state").at(-1)?.data; },
     get contract() { return entries.filter(e => e.customType === "pi-supervisor-contract").at(-1)?.data; },
     set select(value: any) { selectAnswer = value; }, set editor(value: any) { editorAnswer = value; },
-    enqueue(value?: any) { const id = ++responseIndex; if (value !== undefined) this.reply(id, value); return id; },
+    enqueue(value?: any) {
+      const id = ++responseIndex;
+      if (value !== undefined) this.reply(id, value);
+      // A completion claim from the cheap path is always re-verified (L2), so the
+      // fixture answers the escalation call with the same verdict.
+      if (value && typeof value === "object" && !("raw" in value) && value.goal_achieved === true && value.human_needed !== true &&
+        baseContract.completion_criteria.every((criterion: string) =>
+          (value.criteria_evidence || []).some((item: any) => item?.criterion === criterion && typeof item.evidence === "string" && item.evidence.trim()))) this.reply(++responseIndex, value);
+      return id;
+    },
     reply(id: number, value: any) { fs.writeFileSync(path.join(cwd, `reply-${id}.json`), JSON.stringify(value)); },
     waitCall: (id: number) => waitFile(path.join(cwd, `call-${id}.json`)),
     callCount: () => Number(fs.existsSync(path.join(cwd, "judge-count")) ? fs.readFileSync(path.join(cwd, "judge-count"), "utf8") : 0),
     callArgs: (id: number) => JSON.parse(fs.readFileSync(path.join(cwd, `call-${id}.json`), "utf8")),
+    nativeContext: (id: number) => JSON.parse(fs.readFileSync(path.join(cwd, `context-${id}.json`), "utf8")),
+    promptOf: (logDir: string) => JSON.parse(fs.readFileSync(path.join(logDir, "request.json"), "utf8")).prompt,
     audit: () => fs.existsSync(config.defaults.logFile) ? fs.readFileSync(config.defaults.logFile, "utf8").trim().split("\n").map(line => JSON.parse(line)).filter(row => row.sessionId === sessionId) : [],
+    bus: (name: string, payload: any) => pi.events.emit(name, payload),
+    say: (text: string) => event("turn_end", { message: { role: "assistant", content: [{ type: "text", text }] } }),
     settle: (outcome = "completed") => event("agent_before_settle", { outcome, context: { pendingMessages: [], contextMessages: [], contextEntries: [] } }),
     async status(details = false) { await command(details ? "details" : "status"); return notifications.at(-1)!; },
-    async switchSession(next: any[] = []) { entries = structuredClone(next); sessionId = "another-session"; await event("session_start"); },
+    async switchSession(next: any[] = []) { entries = structuredClone(next); sessionId = `another-session-${path.basename(cwd)}`; await event("session_start"); },
+    async restoreBranch(next: any[]) { entries = structuredClone(next); await event("session_start"); },
   };
 }
 
@@ -372,7 +398,7 @@ test("criterion-level evidence completes once and --supervise cannot restart it"
   assert.equal(h.state.lifecycle, "completed");
   assert.ok(JSON.stringify(result).includes("✅"));
   assert.equal(await h.settle(), undefined);
-  assert.equal(h.callCount(), 1);
+  assert.equal(h.callCount(), 2, "cheap pass then deep verification");
 });
 
 test("manual completion uses the same evidence gate as automatic enforcement", async () => {
@@ -430,9 +456,10 @@ function judgeEvents(verdict: any, noiseSize = 180_000): string {
 test("large agent_end cannot evict a valid final judgement", async () => {
   const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
   h.enqueue({ raw: judgeEvents(success()) });
+  h.enqueue({ raw: judgeEvents(success()) });
   await h.settle();
   assert.equal(h.state.lifecycle, "completed");
-  assert.equal(h.callCount(), 1);
+  assert.equal(h.callCount(), 2, "cheap pass then deep verification");
 });
 
 test("failover logs the complete retry privately and preserves both attempts", async () => {
@@ -442,11 +469,13 @@ test("failover logs the complete retry privately and preserves both attempts", a
   h.enqueue({ raw: JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "not a JSON verdict" }], stopReason: "stop", usage: { input: 4, output: 6, totalTokens: 10 } } }) });
   const stderr = "retry diagnostic\n".repeat(2000);
   h.enqueue({ raw, stderr });
+  h.enqueue({ raw, stderr });
   await h.settle();
   assert.equal(h.state.lifecycle, "completed");
   const attempts = h.audit().filter(row => row.event === "judge-attempt");
-  assert.equal(attempts.length, 2);
-  assert.equal(attempts[0].fullLogging, false);
+  assert.equal(attempts.length, 3, "primary failure, backup pass, then deep verification");
+  assert.equal(attempts[2].tier, "L2");
+  assert.equal(attempts[0].fullLogging, true, "every round keeps its raw log for later retrieval");
   assert.equal(attempts[0].errorKind, "parse");
   assert.equal(attempts[0].model, "fixture/primary");
   assert.equal(attempts[1].fullLogging, true);
@@ -457,36 +486,38 @@ test("failover logs the complete retry privately and preserves both attempts", a
   assert.equal(h.callArgs(1).includes("--no-session"), true);
   const dir = attempts[1].logDir;
   assert.equal(fs.readFileSync(path.join(dir, "stdout.jsonl"), "utf8"), raw + "\n");
-  assert.equal(fs.readFileSync(path.join(dir, "stderr.log"), "utf8"), stderr);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "result.json"), "utf8")).stderr, stderr.slice(-2000));
   const request = JSON.parse(fs.readFileSync(path.join(dir, "request.json"), "utf8"));
   assert.equal(request.parentSessionId, path.basename(h.cwd));
   assert.match(request.prompt, /TASK: ENFORCE_CONTRACT/);
-  const args = h.callArgs(2);
-  assert.equal(args[args.indexOf("--session") + 1], path.join(dir, "session.jsonl"));
-  assert.equal(args.includes("--no-session"), false);
-  assert.ok(fs.existsSync(path.join(dir, "session.jsonl")));
+  assert.equal(h.callArgs(2).includes("--no-session"), true, "each round is an independent session");
+  assert.equal(fs.existsSync(path.join(dir, "session.jsonl")), false, "native history lives in judge-sessions, not a per-attempt copy");
+  assert.equal(fs.existsSync(path.join(dir, "stderr.log")), false);
+  assert.equal(fs.existsSync(path.join(dir, "text.txt")), false);
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "result.json"), "utf8")).ok, true);
-  assert.equal(fs.readFileSync(path.join(dir, "text.txt"), "utf8"), JSON.stringify(success()));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "result.json"), "utf8")).text, JSON.stringify(success()));
   if (process.platform !== "win32") {
     assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
-    for (const file of ["request.json", "stdout.jsonl", "stderr.log", "text.txt", "result.json", "session.jsonl"])
+    for (const file of ["request.json", "stdout.jsonl", "result.json"])
       assert.equal(fs.statSync(path.join(dir, file)).mode & 0o777, 0o600);
   }
   const usage = h.audit().find(row => row.event === "judge-usage");
-  assert.equal(usage.ms, attempts[0].ms + attempts[1].ms);
-  assert.equal(usage.usage.totalTokens, 40);
+  assert.equal(usage.ms, attempts.reduce((sum, row) => sum + row.ms, 0), "usage covers every attempt of the round");
+  assert.ok(usage.usage.totalTokens >= 40);
 });
 
-test("the next enforcement after failure enables full logs before it starts", async () => {
+test("every judgement round keeps its own raw log, independent of success or failure", async () => {
   const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
   h.enqueue({ raw: "bad first answer" }); await h.settle();
   assert.equal(h.state.judgeFailures, 1);
   h.enqueue(success()); await h.settle();
   const attempts = h.audit().filter(row => row.event === "judge-attempt");
-  assert.equal(attempts.length, 2);
-  assert.equal(attempts[0].fullLogging, false);
-  assert.equal(attempts[1].fullLogging, true);
-  assert.equal(h.callArgs(2).includes("--session"), true);
+  assert.equal(attempts.length, 3, "failure round, retry round, then deep verification");
+  for (const attempt of attempts) {
+    assert.equal(attempt.fullLogging, true);
+    assert.equal(attempt.logComplete, true);
+    assert.ok(fs.existsSync(path.join(attempt.logDir, "stdout.jsonl")));
+  }
 });
 
 for (const lifecycle of ["paused", "active"]) {
@@ -499,7 +530,7 @@ for (const lifecycle of ["paused", "active"]) {
     assert.equal(h.state.iterations, 7);
     assert.equal(h.state.judgeFailures, 0);
     assert.equal(h.sends.filter(s => s.triggerTurn).length, 0);
-    assert.equal(h.callArgs(1).includes("--session"), true);
+    assert.equal(h.callArgs(1).includes("--no-session"), true, "retry is still an independent round");
   });
 }
 
@@ -515,8 +546,10 @@ test("log finalization failure rejects a valid verdict instead of claiming full 
   const h = await harness({ entries: [contractEntry(), stateEntry("paused")] });
   const id = h.enqueue(); const pending = h.command("retry"); await h.waitCall(id);
   const args = h.callArgs(id);
-  const dir = path.dirname(args[args.indexOf("--session") + 1]);
-  fs.mkdirSync(path.join(dir, "text.txt"));
+  const dir = fs.readdirSync(config.defaults.judgeLogDir).map(name => path.join(config.defaults.judgeLogDir, name)).find(dir => {
+    try { return JSON.parse(fs.readFileSync(path.join(dir, "request.json"), "utf8")).parentSessionId === path.basename(h.cwd); } catch { return false; }
+  })!;
+  fs.mkdirSync(path.join(dir, "result.json"));
   h.reply(id, success()); await pending;
   assert.equal(h.state.lifecycle, "paused");
   assert.equal(h.state.lastJudge.attempts[0].errorKind, "logging");
@@ -566,9 +599,11 @@ for (const action of ["cancel", "switch-session", "resume", "pause"]) {
     assert.deepEqual(h.entries, before);
     assert.equal(h.sends.length, sendsBefore);
     assert.equal(h.aborts, 0);
-    const args = h.callArgs(id);
-    const file = args[args.indexOf("--session") + 1];
-    const saved = JSON.parse(fs.readFileSync(path.join(path.dirname(file), "result.json"), "utf8"));
+    const logs = fs.readdirSync(config.defaults.judgeLogDir).filter(name => name.includes("-"));
+    const dir = logs.map(name => path.join(config.defaults.judgeLogDir, name)).find(dir => {
+      try { return JSON.parse(fs.readFileSync(path.join(dir, "request.json"), "utf8")).parentSessionId === path.basename(h.cwd); } catch { return false; }
+    })!;
+    const saved = JSON.parse(fs.readFileSync(path.join(dir, "result.json"), "utf8"));
     assert.equal(saved.errorKind, "invalidated");
   });
 }
@@ -590,6 +625,17 @@ test("spawn failure is diagnosed without retrying the same missing command on a 
   assert.equal(h.state.lastJudge.attempts[0].errorKind, "spawn");
   assert.match(h.notifications.at(-1)!, /judgeCommand/);
   assert.equal(h.sends.length, 0);
+});
+
+test("session shutdown invalidates an owned judge before a reload replaces its runtime", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("paused")] });
+  const id = h.enqueue(); const pending = h.command("retry"); await h.waitCall(id);
+  await h.event("session_shutdown", { reason: "reload" });
+  const before = structuredClone(h.entries);
+  h.reply(id, success()); await pending;
+  assert.deepEqual(h.entries, before);
+  assert.equal(h.sends.length, 0);
+  assert.equal(h.aborts, 0);
 });
 
 test("timeout diagnostics retain complete output and never report completion", async () => {
@@ -633,3 +679,290 @@ for (const stopReason of ["toolUse", "error"]) {
     assert.equal(h.state.judgeFailures, 1);
   });
 }
+
+
+const judgePrompts = (h: any) => h.audit().filter((row: any) => row.event === "judge-attempt").map((row: any) => h.promptOf(row.logDir));
+
+function evidenceVerdict(file: string, overrides: Record<string, unknown> = {}) {
+  return { goal_achieved: false, human_needed: false, reason: "部分完成",
+    criteria_evidence: [{ criterion: baseContract.completion_criteria[0], evidence: `直接读取 ${file} 确认` }],
+    unmet_conditions: [baseContract.completion_criteria[1]], ...overrides };
+}
+
+test("each round is an independent session but reuses the verified structured state", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  const file = path.join(h.cwd, "evidence.md"); fs.writeFileSync(file, "verified content");
+  h.enqueue(evidenceVerdict(file)); await h.settle();
+  await h.say("第二轮：继续核验其它条件");
+  h.enqueue(evidenceVerdict(file)); await h.settle();
+  assert.equal(h.callArgs(1).includes("--no-session"), true);
+  assert.equal(h.callArgs(2).includes("--no-session"), true);
+  const [first, second] = judgePrompts(h);
+  assert.match(first, /首次核验/);
+  assert.match(second, /结构化状态/);
+  assert.match(second, /已满足/);
+  assert.ok(second.includes(file), "reused evidence is named so the judge need not re-read it");
+  assert.match(second, /仍然有效、可直接复用的证据/);
+  assert.doesNotMatch(second, /部分完成/, "previous round's free text is not replayed");
+});
+
+test("pause, resume and reload keep the structured state for the next round", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  const file = path.join(h.cwd, "kept.md"); fs.writeFileSync(file, "kept");
+  h.enqueue(evidenceVerdict(file)); await h.settle();
+  await h.command("pause"); await h.command("resume"); await h.event("session_start");
+  await h.say("恢复后继续");
+  h.enqueue({ goal_achieved: false, reason: "继续" }); await h.command("judge");
+  assert.match(judgePrompts(h).at(-1)!, /已满足/);
+});
+
+test("cancel then start does not inherit the previous task's state", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  const file = path.join(h.cwd, "old-task.md"); fs.writeFileSync(file, "old");
+  h.enqueue(evidenceVerdict(file)); await h.settle();
+  h.select = "取消"; await h.command("cancel");
+  h.editor = (prefill: string) => prefill; h.enqueue(candidate()); await h.command("start");
+  h.enqueue({ goal_achieved: false, reason: "新任务" }); await h.command("judge");
+  assert.match(judgePrompts(h).at(-1)!, /首次核验/);
+});
+
+test("confirming a changed contract resets the state instead of carrying old criteria", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  const file = path.join(h.cwd, "old-contract.md"); fs.writeFileSync(file, "old");
+  h.enqueue(evidenceVerdict(file)); await h.settle();
+  h.editor = (prefill: string) => prefill;
+  h.enqueue({ ...candidate(), completion_criteria: ["新的完成条件"] }); await h.command("replan");
+  h.enqueue({ goal_achieved: false, reason: "新契约" }); await h.command("judge");
+  assert.match(judgePrompts(h).at(-1)!, /首次核验/);
+});
+
+test("a cloned main session and a rewound branch cannot reuse another task's state", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  const file = path.join(h.cwd, "branch.md"); fs.writeFileSync(file, "branch");
+  const before = structuredClone(h.entries);
+  h.enqueue(evidenceVerdict(file)); await h.settle();
+  await h.restoreBranch(before);
+  await h.say("回退后继续");
+  fs.writeFileSync(file, "changed after rewind");
+  h.enqueue({ goal_achieved: false, reason: "回退后" }); await h.command("judge");
+  assert.match(judgePrompts(h).at(-1)!, /失效|待重新核验/, "rewound evidence must not be reused blindly");
+  await h.switchSession(h.entries);
+  h.enqueue({ goal_achieved: false, reason: "新会话" }); await h.command("judge");
+  assert.match(judgePrompts(h).at(-1)!, /首次核验/);
+});
+
+test("L0 keeps an unchanged unmet condition without spending a model call", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  h.enqueue({ goal_achieved: false, human_needed: false, reason: "仍缺证据",
+    criteria_evidence: [], unmet_conditions: baseContract.completion_criteria }); await h.settle();
+  assert.equal(h.callCount(), 1);
+  await h.settle();
+  assert.equal(h.callCount(), 1, "no new model call when nothing changed");
+  assert.ok(h.audit().some(row => row.event === "judge-l0"));
+  assert.equal(h.state.iterations, 2);
+});
+
+test("a completion claim is re-verified by a deep L2 call before the pause is allowed", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")], profile: { enforceReadTools: true } });
+  h.enqueue(success()); await h.settle();
+  assert.equal(h.state.lifecycle, "completed");
+  const attempts = h.audit().filter(row => row.event === "judge-attempt");
+  assert.deepEqual(attempts.map(row => row.tier), ["L1", "L2"]);
+  assert.ok(h.callArgs(1).includes("--no-tools"));
+  assert.ok(h.callArgs(2).includes("--tools"));
+  assert.match(attempts[1].escalation, /L1 声称完成/);
+});
+
+test("changed evidence is marked stale and only that condition is re-verified", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")], profile: { enforceReadTools: true } });
+  const file = path.join(h.cwd, "changed.md"); fs.writeFileSync(file, "v1");
+  h.enqueue(evidenceVerdict(file)); await h.settle();
+  fs.writeFileSync(file, "v2");
+  await h.say("第二轮：文件已改，请复核");
+  h.enqueue({ goal_achieved: false, reason: "文件已改" }); await h.settle();
+  const prompt = judgePrompts(h).at(-1)!;
+  assert.match(prompt, /失效|待重新核验/);
+  assert.doesNotMatch(prompt, /仍然有效、可直接复用的证据\n- \[.*changed\.md/, "a changed file is not offered as reusable");
+  assert.equal(h.audit().filter(row => row.event === "judge-attempt").at(-1)!.tier, "L2");
+});
+
+test("a candidate with open questions asks for clarification instead of reporting abandonment", async () => {
+  const h = await harness();
+  h.editor = (prefill: string) => prefill;
+  h.enqueue({ ...candidate(), open_questions: ["#31 是否已被取代？"] });
+  await h.command("start");
+  assert.equal(h.contract, undefined, "supervision must not start with unresolved questions");
+  const notified = h.notifications.join("\n");
+  assert.doesNotMatch(notified, /已放弃/);
+  assert.match(notified, /澄清|待确认/);
+  assert.ok(h.editors[0].includes("#31 是否已被取代"), "the question is shown in the editor");
+});
+
+test("answering the open questions re-infers the contract and only then starts", async () => {
+  const h = await harness();
+  let answered = false;
+  h.editor = (prefill: string) => answered ? prefill : (answered = true, `${prefill}按 §G-98 已取代，视为闭合`);
+  h.enqueue({ ...candidate(), open_questions: ["#31 是否已被取代？"] });
+  h.enqueue(candidate());
+  await h.command("start");
+  assert.equal(h.callCount(), 2, "clarification feedback triggers a fresh inference");
+  assert.equal(h.contract?.mission, baseContract.mission);
+  assert.equal(h.state.lifecycle, "active");
+});
+
+test("a missing escalation agent is treated as unset, with a hint instead of a warning", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")],
+    profile: { escalationAgent: "definitely-not-installed" } });
+  await h.command("details");
+  assert.match(h.notifications.at(-1)!, /escalation:.*未找到.*按未设置处理/);
+  h.enqueue({ goal_achieved: false }); await h.settle();
+  const prompt = judgePrompts(h).at(-1)!;
+  assert.doesNotMatch(prompt, /升级诊断|escalation/);
+  assert.equal(h.notifications.some(n => /definitely-not-installed/.test(n) && /警告|warning/i.test(n)), false);
+});
+
+test("a project-level escalation agent is discovered and named in the judgement prompt", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")], profile: { escalationAgent: "escalation" } });
+  fs.mkdirSync(path.join(h.cwd, ".pi", "agents"), { recursive: true });
+  fs.writeFileSync(path.join(h.cwd, ".pi", "agents", "escalation.md"), "# escalation");
+  h.enqueue({ goal_achieved: false }); await h.settle();
+  assert.match(judgePrompts(h).at(-1)!, /escalation/);
+  assert.match(judgePrompts(h).at(-1)!, /升级诊断/);
+  await h.command("details");
+  assert.match(h.notifications.at(-1)!, /escalation: escalation/);
+});
+
+test("resume explains the real state instead of claiming there is nothing to resume", async () => {
+  const active = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  await active.command("resume");
+  assert.match(active.notifications.at(-1)!, /监督中|正在进行/);
+  assert.match(active.notifications.at(-1)!, /retry|pause/);
+  assert.equal(active.state.lifecycle, "active");
+
+  const orphan = await harness({ entries: [contractEntry(), stateEntry("paused")] });
+  orphan.entries.splice(0, orphan.entries.length, stateEntry("paused"));
+  await orphan.event("session_start");
+  await orphan.command("resume");
+  assert.match(orphan.notifications.at(-1)!, /缺少有效契约/);
+
+  const done = await harness({ entries: [contractEntry(), stateEntry("completed")] });
+  await done.command("resume");
+  assert.match(done.notifications.at(-1)!, /已结束|已完成|start/);
+});
+
+test("supervision waits while an async subagent of this session is still running", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  const sessionId = path.basename(h.cwd);
+  h.bus("subagent:async-started", { id: "run-1", sessionId });
+  h.enqueue({ goal_achieved: false }); await h.settle();
+  assert.equal(h.callCount(), 0, "no judgement while a child still runs");
+  assert.ok(h.audit().some(row => row.event === "settle-deferred"));
+  h.bus("subagent:async-complete", { runId: "run-1", sessionId });
+  h.enqueue({ goal_achieved: false }); await h.settle();
+  assert.equal(h.callCount(), 1);
+  assert.equal(h.state.lifecycle, "active");
+});
+
+test("another session's subagent does not block this session, and stale starts stop blocking", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  h.bus("subagent:async-started", { id: "foreign", sessionId: "some-other-session" });
+  h.enqueue({ goal_achieved: false }); await h.settle();
+  assert.equal(h.callCount(), 1, "a foreign run must not gate this session");
+
+  const stale = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  stale.bus("subagent:async-started", { id: "run-old", sessionId: path.basename(stale.cwd), startedAt: Date.now() - 3 * 60 * 60 * 1000 });
+  stale.enqueue({ goal_achieved: false }); await stale.settle();
+  assert.equal(stale.callCount(), 1, "a run that never reported completion cannot block forever");
+});
+
+test("a repeated no-progress verdict pauses instead of looping forever", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")], profile: { stagnationRounds: 3 } });
+  const same = { goal_achieved: false, human_needed: false, reason: "仍未完成",
+    criteria_evidence: [], unmet_conditions: baseContract.completion_criteria,
+    next_step: "派发只读核验，采集完整 Git 状态与锁记录" };
+  for (let round = 0; round < 4; round += 1) { h.enqueue(same); await h.settle(); await h.say(`第 ${round + 2} 轮：剩余阻断都是人类批准门`); }
+  assert.ok(h.say);
+  assert.equal(h.state.lifecycle, "paused");
+  assert.match(h.state.reason, /stagnation/);
+  assert.ok(h.audit().some(row => row.event === "judge-stagnation"));
+});
+
+test("new evidence resets the stagnation counter", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")], profile: { stagnationRounds: 3 } });
+  const file = path.join(h.cwd, "new-evidence.md"); fs.writeFileSync(file, "v1");
+  const stuck = { goal_achieved: false, human_needed: false, reason: "仍未完成",
+    criteria_evidence: [], unmet_conditions: baseContract.completion_criteria, next_step: "再核验" };
+  h.enqueue(stuck); await h.settle(); await h.say("第二轮");
+  h.enqueue(stuck); await h.settle(); await h.say("第三轮");
+  h.enqueue(evidenceVerdict(file)); await h.settle();
+  assert.equal(h.state.lifecycle, "active", "new evidence must not be treated as stagnation");
+});
+
+test("the stagnation prompt shows the repeated next steps so the judge must change course", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")], profile: { stagnationRounds: 2 } });
+  const stuck = { goal_achieved: false, human_needed: false, reason: "仍未完成",
+    criteria_evidence: [], unmet_conditions: baseContract.completion_criteria, next_step: "重复派发只读核验" };
+  h.enqueue(stuck); await h.settle(); await h.say("第二轮");
+  h.enqueue(stuck); await h.settle(); await h.say("第三轮");
+  h.enqueue({ ...stuck, next_step: "确认人类批准门" }); await h.settle();
+  const prompt = judgePrompts(h).at(-1)!;
+  assert.match(prompt, /连续 \d+ 轮无新增证据/);
+  assert.match(prompt, /重复派发只读核验/);
+  assert.match(prompt, /human_needed/);
+});
+
+function installEscalationAgent(h: any) {
+  fs.mkdirSync(path.join(h.cwd, ".pi", "agents"), { recursive: true });
+  fs.writeFileSync(path.join(h.cwd, ".pi", "agents", "escalation.md"),
+    "---\nname: escalation\nthinking: low\n---\n判断哪些阻断需要人类，哪些仍可执行。\n");
+}
+const adjudication = (human: any[], executable: any[], reason = "判定") =>
+  ({ human_required: human, executable, reason, confidence: "high" });
+
+test("escalation turns an approval-only claim into executable work instead of pausing", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")], profile: { escalationAgent: "escalation" } });
+  installEscalationAgent(h);
+  h.enqueue({ ...success(), human_needed: true, reason: "剩余都是人类批准门" });
+  h.enqueue(adjudication([], [{ action: "重放 V5 采集并比对哈希", why: "只读可执行" }], "仍有可执行工作"));
+  const result = await h.settle();
+  assert.equal(h.state.lifecycle, "active", "must not pause when escalation finds executable work");
+  assert.match(JSON.stringify(result), /重放 V5/);
+  assert.ok(h.audit().some(row => row.event === "escalation-override"));
+  assert.equal(h.state.escalations ?? 1, 1);
+});
+
+test("escalation confirms real human gates and pauses with the item list", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")], profile: { escalationAgent: "escalation" } });
+  installEscalationAgent(h);
+  h.enqueue({ ...success(), human_needed: true });
+  h.enqueue(adjudication([{ item: "安装批准", why: "不可逆" }], [], "需要人类"));
+  const result = await h.settle();
+  assert.equal(h.state.lifecycle, "paused");
+  assert.match(h.state.reason, /escalation human gate/);
+  assert.match(JSON.stringify(result), /安装批准/);
+  assert.ok(h.audit().some(row => row.event === "escalation-human-gate"));
+});
+
+test("escalation calls are bounded per task, then the original human gate applies", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active", { escalations: 1 })], profile: { escalationMaxCalls: 1 } });
+  installEscalationAgent(h);
+  h.enqueue({ ...success(), human_needed: true });
+  const result = await h.settle();
+  assert.equal(h.state.lifecycle, "paused");
+  assert.ok(h.audit().some(row => row.event === "escalation-skipped"));
+  assert.match(JSON.stringify(result), /已暂停/);
+});
+
+test("stagnation consults escalation before pausing and continues on executable advice", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")], profile: { stagnationRounds: 2, escalationAgent: "escalation" } });
+  installEscalationAgent(h);
+  const stuck = { goal_achieved: false, human_needed: false, reason: "仍未完成",
+    criteria_evidence: [], unmet_conditions: baseContract.completion_criteria, next_step: "再核验" };
+  h.enqueue(stuck); await h.settle(); await h.say("第二轮");
+  h.enqueue(stuck); await h.settle(); await h.say("第三轮");
+  h.enqueue(stuck);
+  h.enqueue(adjudication([], [{ action: "补齐 89 项候选适用性登记" }], "可执行"));
+  const result = await h.settle();
+  assert.equal(h.state.lifecycle, "active");
+  assert.match(JSON.stringify(result), /补齐 89 项候选适用性登记/);
+});

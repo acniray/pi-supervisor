@@ -4,6 +4,8 @@
 config.json
 verdicts.jsonl
 judge-logs/
+state/
+evidence-index/
 
 # Soft-stop switch (touch this file to make the supervisor yield)
 STOP

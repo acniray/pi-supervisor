@@ -31,7 +31,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -42,7 +42,11 @@ import type {
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { classifyStopError } from "./quota.ts";
-import { addUsage, emptyUsage, runJudgeOnce, type JudgeAttempt, type JudgeErrorKind, type JudgeResult, type JudgeRunContext, type UsageSummary } from "./judge.ts";
+import { addUsage, emptyUsage, resolveJudgeExtension, runJudgeOnce, type JudgeAttempt, type JudgeErrorKind, type JudgeResult, type JudgeRunContext, type UsageSummary } from "./judge.ts";
+import { applyVerdict, canShortCircuit, clearState, hashText, invalidate as invalidateEvidence, needsDeepCheck, readState, snapshotRepo, stateDigest, writeState, type Invalidation, type TaskState } from "./judge-state.ts";
+import { indexAttempt, searchEvidence } from "./evidence-index.ts";
+import { escalationHint, findAgent, type AgentLookup } from "./agent-lookup.ts";
+import { escalationPrompt, loadAgentDefinition, parseAdjudication, type EscalationAdjudication } from "./escalation.ts";
 
 const EXT_DIR = path.join(os.homedir(), ".pi", "agent", "extensions", "pi-supervisor");
 const CONFIG_PATH = process.env.PI_SUPERVISOR_CONFIG || process.env.STOP_SUPERVISOR_CONFIG || path.join(EXT_DIR, "config.json");
@@ -92,6 +96,16 @@ interface Profile {
   judgeTimeoutMs?: number;
   /** Private full-log root; retries always log before spawning the judge. */
   judgeLogDir?: string;
+  /** Consecutive no-new-evidence rounds before supervision pauses instead of looping. */
+  stagnationRounds?: number;
+  /** Real adjudication by the configured escalation agent before honouring human gates. */
+  escalationTimeoutMs?: number;
+  escalationMaxCalls?: number;
+  /** Structured per-task judgement state and its evidence index. */
+  judgeStateDir?: string;
+  judgeIndexDir?: string;
+  /** Explicit provider extensions for the judge only (e.g. npm:pi-provider-qoder). */
+  judgeExtensions?: string[];
   /** Bootstrap judge timeout (read-only tools; can take minutes on big repos). */
   bootstrapTimeoutMs?: number;
   maxIterations?: number;
@@ -135,6 +149,11 @@ interface Contract {
 
 type Lifecycle = "inactive" | "drafting" | "active" | "paused" | "cancelled" | "completed";
 
+function judgeContractKey(contract: Contract): string {
+  const keys: Array<keyof Contract> = ["mission", "completion_criteria", "boundaries", "decision_policy", "record_policy", "stop_conditions", "autonomy_rules"];
+  return createHash("sha256").update(JSON.stringify(keys.map(key => contract[key]))).digest("hex");
+}
+
 interface JudgeDiagnosis {
   at: string;
   ok: boolean;
@@ -146,6 +165,8 @@ function judgeRecovery(kind?: JudgeErrorKind): string {
   switch (kind) {
     case "spawn": return "检查 judgeCommand 是否存在及可执行；处理后 /supervisor retry。";
     case "logging": return "检查日志目录权限、可用空间及路径；处理后 /supervisor retry。";
+    case "session": return "检查固定判官会话的路径、权限或缺失历史；不会自动清空旧上下文，处理后 /supervisor retry。";
+    case "extension": return "检查 judgeExtensions 配置的包名或路径是否存在且可加载；判官仍禁用其它扩展，处理后 /supervisor retry。";
     case "timeout": return "查看最后事件/工具及完整日志，检查耗时或阻塞；必要时由你调整超时后 /supervisor retry。";
     case "provider": return "查看 provider 原始错误，处理认证、额度或服务问题后 /supervisor retry；不自动替换模型。";
     case "exit": return "查看 stderr.log 和退出原因；处理子进程错误后 /supervisor retry。";
@@ -199,6 +220,9 @@ const DEFAULTS = {
   bootstrapTimeoutMs: 300_000,
   maxIterations: 300,
   maxJudgeFailures: 2,
+  stagnationRounds: 3,
+  escalationTimeoutMs: 180_000,
+  escalationMaxCalls: 3,
   smartCompaction: true,
   escalationAgent: "astra-escalation",
   judgeCommand: "pi",
@@ -573,11 +597,20 @@ async function runJudge(prompt: string, profile: Profile, cwd: string, withTools
   const thinking = profile.judgeThinking || DEFAULTS.judgeThinking;
   const timeoutMs = timeoutOverrideMs ?? profile.judgeTimeoutMs ?? DEFAULTS.judgeTimeoutMs;
   const callId = randomUUID();
-  const base = { prompt, cwd, withTools, command, timeoutMs, signal, ...context, callId,
+  let extensionPaths: string[];
+  try {
+    const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+    extensionPaths = asStringArray(profile.judgeExtensions, 8).map(spec => resolveJudgeExtension(spec, cwd, agentDir));
+  } catch (error) {
+    return { ok: false, error: `判官扩展加载前的解析失败：${String(error)}`, errorKind: "extension",
+      failovers: [], attempts: [{ callId, attemptId: randomUUID(), model: primary, fullLogging: true, logComplete: false,
+        kind: context.kind, ok: false, errorKind: "extension", error: String(error), ms: 0, stdoutBytes: 0, stderrBytes: 0 }], ms: 0 };
+  }
+  const base = { prompt, cwd, withTools, command, timeoutMs, signal, ...context, callId, extensionPaths,
     logRoot: resolvePath(profile.judgeLogDir || path.join(EXT_DIR, "judge-logs"), cwd) };
   const first = await runJudgeOnce({ ...base, model: primary, thinking });
   const fallback = profile.judgeFailover !== false ? profile.judgeFailoverModel : undefined;
-  if (first.ok || signal?.aborted || first.errorKind === "logging" || first.errorKind === "spawn" || !fallback || fallback === primary) return first;
+  if (first.ok || signal?.aborted || first.errorKind === "logging" || first.errorKind === "session" || first.errorKind === "spawn" || !fallback || fallback === primary) return first;
 
   const second = await runJudgeOnce({ ...base, model: fallback,
     thinking: profile.judgeFailoverThinking || thinking, fullLogging: true });
@@ -636,7 +669,7 @@ function userNotesBlock(contract: Contract): string {
     : "";
 }
 
-function buildBootstrapPrompt(profile: Profile, ctx: ExtensionContext, feedback: string): string {
+function buildBootstrapPrompt(profile: Profile, ctx: ExtensionContext, feedback: string, escalation?: string): string {
   return `${BOOTSTRAP_MARKER}
 
 根据当前 session 中用户的请求，推断一个简洁、可核验的监督终点。
@@ -647,7 +680,7 @@ function buildBootstrapPrompt(profile: Profile, ctx: ExtensionContext, feedback:
 信息不足时提出具体 open_questions，不要编造目标、文件、规则或授权。
 ${profile.goal?.trim() ? `用户固定目标：${profile.goal.trim()}` : ""}
 ${feedback ? `用户对上次候选的修改要求（必须满足）：\n${feedback}` : ""}
-${profile.escalationAgent ? `已配置的可用升级诊断 agent：${profile.escalationAgent}；仅在会话或必要决策规则要求时采用，不强制每个任务调用。` : ""}
+${escalation ? `已配置的可用升级诊断 agent：${escalation}；仅在会话或必要决策规则要求时采用，不强制每个任务调用。` : ""}
 
 ${sessionExcerpt(ctx)}
 
@@ -668,49 +701,6 @@ ${gitInfo(ctx.cwd)}
   "open_questions": ["会影响终点或边界、必须澄清的问题；没有则 []"]
 }
 不要为了填满字段增添决策、登记、升级或无人值守流程。`;
-}
-
-function buildEnforcePrompt(contract: Contract, ctx: ExtensionContext, lastText: string, iteration: number, _escalationAgent: string): string {
-  return `${ENFORCE_MARKER}
-
-你是终点核验者。根据已确认的契约、主 Agent 汇报和直接证据，判断是否真正完成。
-
-## 已确认契约（目标、完成条件与必要限制不可由运行时偷偷改变）
-${contractSummary(contract, true)}
-
-${userNotesBlock(contract)}
-## 主 Agent 最近汇报
-${truncateMiddle(lastText || "(无)", 8000)}
-
-## 客观证据
-${gitInfo(ctx.cwd)}
-
-核验序号：${iteration}
-
-规则：
-1. 逐项核验 completion_criteria。goal_achieved=true 必须每项有直接证据，且无未完成条件、证据冲突、规则违反或缺失记录；汇报篇幅、口头承诺、阶段检查点不算完成证据。
-2. criteria_evidence 每项包含 criterion（原完成条件完整文本）和 evidence（对应文件/测试/提交/工具结果的具体证据）。重复项不能替代其他条件。无法验证就列入 unmet_conditions 并给出最小核验动作。
-3. 已确认终点保持稳定。通常只更新 furthest_progress / next_steps；不要输出 mission / completion_criteria / boundaries 或其他约束的修改。只有用户目标改变、关键前提失效、或新证据确实动摇终点时，填写 contract_change，要求重新确认，不自行采用新目标。
-4. human_needed 仅在权限、凭据、目标歧义等确实需要人处理且无独立可推进工作时为 true；遵守已确认的必要决策策略，但不额外强制调用默认升级 agent。goal_achieved 与 human_needed 不可同时为 true。
-5. 一般继续时只报告最重要的未闭环条件和下一步。可安全自主处理的事项不制造人类阻塞。
-6. compact_now 仅在检查点已持久化、压缩不会丢失后续必要信息时为 true；compact_focus 必须要求保留目标、全部完成条件、必要限制和进度。
-
-严格输出 JSON：
-{
-  "goal_achieved": false,
-  "human_needed": false,
-  "reason": "一句话依据",
-  "criteria_evidence": [{"criterion": "原完成条件完整文本", "evidence": "该条件的具体证据"}],
-  "unmet_conditions": ["尚未闭环的完成条件；没有则 []"],
-  "evidence_conflicts": ["证据矛盾；没有则 []"],
-  "contract_change": "仅终点或边界确需重新确认时说明，否则空串",
-  "next_step": "最小可执行核验或推进动作",
-  "contract_updates": {"furthest_progress": "最新有证据的进度", "next_steps": ["下一步"]},
-  "policy_violations": [],
-  "records_missing": [],
-  "compact_now": false,
-  "compact_focus": ""
-}`;
 }
 
 // ---------------------------------------------------------------- extension
@@ -760,6 +750,18 @@ export default function (pi: ExtensionAPI) {
   let contract: Contract | undefined;
   let lastVerdict: Verdict | undefined;
   let lastJudge: JudgeDiagnosis | undefined;
+  let escalationUnavailable = false;
+  /** Async child runs owned by this session; supervision must not judge mid-work. */
+  const runningSubagents = new Map<string, number>();
+  const SUBAGENT_STALE_MS = 2 * 60 * 60 * 1000;
+  function pruneSubagents(): void {
+    const now = Date.now();
+    for (const [id, startedAt] of runningSubagents) if (now - startedAt > SUBAGENT_STALE_MS) runningSubagents.delete(id);
+  }
+  function ownedByThisSession(payload: any): boolean {
+    const owner = payload?.sessionId ?? payload?.parentSessionId;
+    return !owner || owner === sessionMeta.id;
+  }
   let judging = false;
   let sessionMeta = { id: "", name: "", file: "" };
   let logCtx: { cwd: string; logFile?: string } = { cwd: process.cwd() };
@@ -825,12 +827,253 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  function judgeContext(kind: string, retry = false): JudgeRunContext {
+  function judgeContext(kind: string): JudgeRunContext {
+    // Independent session per round; history is carried by state + evidence index.
     return { parentSessionId: sessionMeta.id, parentSessionFile: sessionMeta.file,
-      parentSessionName: sessionMeta.name, kind, fullLogging: retry || judgeFailures > 0 };
+      parentSessionName: sessionMeta.name, kind, fullLogging: true };
   }
 
-  function judgeDiagnosisText(): string {
+
+  interface TierOutcome {
+    tier: "L0" | "L1" | "L2";
+    l0Reason?: string;
+    result?: JudgeResult;
+    state?: TaskState;
+    invalidation: Invalidation;
+    changed?: boolean;
+    reused: number;
+    reverified: number;
+    retrievals: number;
+    escalation?: string;
+  }
+
+  /** Resolve the configured escalation agent across user + project agent dirs. */
+  function escalationFor(profile: Profile, cwd: string): AgentLookup & { configured?: string } {
+    const configured = (profile.escalationAgent || "").trim() || undefined;
+    const lookup = findAgent(configured, cwd);
+    if (configured && !lookup.name) escalationUnavailable = true;
+    else if (lookup.name) escalationUnavailable = false;
+    return { ...lookup, configured };
+  }
+
+  function stateRoots(profile: Profile, cwd: string): { state: string; index: string } {
+    return {
+      state: resolvePath(profile.judgeStateDir || path.join(EXT_DIR, "state"), cwd)!,
+      index: resolvePath(profile.judgeIndexDir || path.join(EXT_DIR, "evidence-index"), cwd)!,
+    };
+  }
+
+  function incrementalPrompt(input: {
+    contract: Contract; state?: TaskState; tier: "L1" | "L2"; stale: string[];
+    snippets: string; report: string; round: number; escalation?: string;
+    stagnantRounds?: number; recentNextSteps?: string[];
+  }): string {
+    const valid = (input.state?.criteria || []).filter(item => item.status === "met" && item.evidence.length);
+    const evidenceLines = valid.slice(0, 12).map(item => {
+      const refs = item.evidence.map(ref => ref.kind === "file"
+        ? `${ref.path}（指纹 ${ref.fingerprint?.slice(0, 24)}，第 ${ref.round} 轮核验）`
+        : `${ref.kind}（第 ${ref.round} 轮核验）`).join("；");
+      return `- [${item.id}] ${item.criterion.slice(0, 100)}：${refs}`;
+    });
+    return `TASK: ENFORCE_CONTRACT
+
+你是终点核验者。抓住终点：只在完成条件都有当前有效证据时允许暂停。
+
+## 已确认契约
+${contractSummary(input.contract, true)}
+
+## 结构化状态（扩展维护，非模型总结）
+${input.state ? stateDigest(input.state) : "(首次核验，无历史状态)"}
+
+## 仍然有效、可直接复用的证据
+${evidenceLines.length ? evidenceLines.join("\n") : "(无)"}
+
+## 失效/待重新核验
+${input.stale.length ? input.stale.map(id => `- ${id}`).join("\n") : "(无)"}
+${input.snippets ? `\n## 历史证据片段（按需检索，原始记录在 judge-logs）\n${input.snippets}\n` : ""}
+## 主 Agent 最近汇报
+${truncateMiddle(input.report || "(无)", 6000)}
+
+${(input.stagnantRounds ?? 0) >= 1 ? `## 停滞告警（已连续 ${input.stagnantRounds} 轮无新增证据）
+上一轮建议：${(input.recentNextSteps || []).slice(-2).map(step => `\n- ${step}`).join("") || "(无)"}
+本轮必须二选一，不得重复上面的建议：
+- 给出与之前不同、且本轮可执行的具体动作（目标文件/命令/委派对象）；
+- 若剩余阻断只能由人类批准/授权解决，置 human_needed=true 并在 unmet_conditions 列出待批项。
+` : ""}${input.escalation ? `升级诊断 agent：${input.escalation}。若因证据冲突/判断困难而要 human_needed，先建议主 Agent 用它做一次升级诊断；仅当确实需要人类权限/批准时才可直接 human_needed。\n` : ""}核验序号：${input.round}
+本轮路径：${input.tier}${input.tier === "L2" ? "（可用只读工具，只核验失效/缺失/可疑项，不要重读仍有效的证据）" : "（无工具：依据上面状态与本轮汇报判断）"}
+
+规则：
+1. 逐项核验 completion_criteria；goal_achieved=true 必须每项有当前有效证据，且无未完成条件、证据冲突、规则违反或缺失记录。
+2. criteria_evidence 每项给出 criterion 原文与 evidence；引用已复用证据时注明其路径/轮次即可，不必重读。
+3. 历史通过不等于当前通过：失效证据、未标注来源的结论都按未核验处理。
+4. 只有用户目标改变、关键前提失效或新证据确实动摇终点时填 contract_change。
+5. human_needed 仅在确实需要人处理且无独立可推进工作时为 true；goal_achieved 与 human_needed 不同时为 true。
+6. 一般继续只报告最重要的未闭环条件与下一步。
+
+严格输出 JSON：
+{
+  "goal_achieved": false, "human_needed": false, "reason": "一句话依据",
+  "criteria_evidence": [{"criterion": "原完成条件完整文本", "evidence": "具体证据（路径/轮次/结果）"}],
+  "unmet_conditions": [], "evidence_conflicts": [], "contract_change": "",
+  "next_step": "最小可执行动作",
+  "contract_updates": {"furthest_progress": "", "next_steps": []},
+  "policy_violations": [], "records_missing": [], "compact_now": false, "compact_focus": ""
+}`;
+  }
+
+  function wouldComplete(verdict: Verdict | undefined, contract: Contract): boolean {
+    if (!verdict || verdict.goal_achieved !== true || verdict.human_needed === true) return false;
+    const supplied = Array.isArray(verdict.criteria_evidence) ? verdict.criteria_evidence : [];
+    if (asStringArray(verdict.unmet_conditions).length || asStringArray(verdict.evidence_conflicts).length ||
+      asStringArray(verdict.policy_violations).length || asStringArray(verdict.records_missing).length) return false;
+    return contract.completion_criteria.every(criterion => supplied.some(item =>
+      item && item.criterion === criterion && typeof item.evidence === "string" && item.evidence.trim()));
+  }
+
+  /**
+   * Ask the configured escalation agent to separate real human gates from work
+   * the main agent can still do. Runs at most escalationMaxCalls times per task.
+   */
+  async function adjudicate(input: {
+    ctx: ExtensionContext; profile: Profile; contract: Contract; report: string;
+    verdict?: Verdict; round: number; signal?: AbortSignal; state?: TaskState;
+  }): Promise<{ ok: boolean; admin?: EscalationAdjudication; error?: string; logDir?: string; skipped?: boolean }> {
+    const spent = input.state?.escalations ?? 0;
+    const limit = input.profile.escalationMaxCalls ?? DEFAULTS.escalationMaxCalls;
+    if (limit > 0 && spent >= limit) return { ok: false, skipped: true, error: `已达 escalation 上限 ${limit}` };
+    const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+    const { definition, lookup } = loadAgentDefinition(input.profile.escalationAgent, input.ctx.cwd, agentDir);
+    if (!definition) {
+      log({ event: "escalation-skipped", reason: "agent not found", configured: input.profile.escalationAgent || null,
+        searched: lookup.searched.length });
+      return { ok: false, skipped: true, error: "escalation agent 未找到，按未设置处理" };
+    }
+    const prompt = `${escalationPrompt({
+      agent: definition.name,
+      mission: input.contract.mission,
+      criteria: input.contract.completion_criteria,
+      unmet: asStringArray(input.verdict?.unmet_conditions),
+      conflicts: asStringArray(input.verdict?.evidence_conflicts),
+      report: input.report,
+      judgeReason: input.verdict?.reason,
+      judgeNextStep: input.verdict?.next_step,
+      round: input.round,
+    })}
+
+## 角色定义（来自 ${definition.name} 的 agent 文件）
+${definition.body.slice(0, 4000)}`;
+    const withTools = Array.isArray(definition.tools) && definition.tools.length > 0 &&
+      definition.tools.every(tool => ["read", "grep", "find", "ls"].includes(tool));
+    const derived: Profile = { ...input.profile,
+      judgeModel: definition.model || input.profile.judgeModel,
+      judgeThinking: definition.thinking || input.profile.judgeThinking,
+      judgeFailover: false };
+    const result = await runJudge(prompt, derived, input.ctx.cwd, withTools,
+      input.profile.escalationTimeoutMs ?? DEFAULTS.escalationTimeoutMs, input.signal, judgeContext("escalation"));
+    recordJudgeUsage("escalation", result);
+    const admin = result.ok ? parseAdjudication(result.text) : undefined;
+    const last = result.attempts?.at(-1);
+    log({ event: "escalation", ok: Boolean(admin), model: result.model ?? null, ms: result.ms,
+      humanRequired: admin?.humanRequired.length ?? 0, executable: admin?.executable.length ?? 0,
+      error: result.error ?? (admin ? null : "adjudication 解析失败"), logDir: last?.logDir ?? null });
+    return { ok: Boolean(admin), admin, error: result.error, logDir: last?.logDir };
+  }
+
+  async function runTieredJudge(input: {
+    ctx: ExtensionContext; profile: Profile; contract: Contract; report: string;
+    round: number; signal?: AbortSignal; kind: string; allowL0?: boolean; forceDeep?: boolean;
+  }): Promise<TierOutcome> {
+    const { ctx, profile, contract, report, round, signal, kind } = input;
+    const escalationAgentName = escalationFor(profile, ctx.cwd).name;
+    const roots = stateRoots(profile, ctx.cwd);
+    let branchIds: string[] = [];
+    let tip: string | undefined;
+    try {
+      const entries = ctx.sessionManager.getBranch() as Array<{ id?: string }>;
+      branchIds = entries.map(entry => entry.id).filter((id): id is string => typeof id === "string");
+      tip = branchIds.at(-1);
+    } catch { /* branch info is best effort; state keying still isolates by session */ }
+    const contractKey = judgeContractKey(contract);
+    const state = readState(roots.state, sessionMeta.id, contractKey, branchIds);
+    const repo = snapshotRepo(ctx.cwd);
+    const invalidation = state ? invalidateEvidence(state, repo, ctx.cwd) : { stale: [], reason: "" };
+    const reused = (state?.criteria || []).filter(item => item.status === "met").reduce((total, item) => total + item.evidence.length, 0);
+
+    if (input.allowL0 !== false) {
+      const l0Reason = canShortCircuit(state, hashText(report), invalidation);
+      if (l0Reason) return { tier: "L0", l0Reason, state, invalidation, reused, reverified: 0, retrievals: 0 };
+    }
+
+    const staleIds = invalidation.stale.map(item => item.id);
+    let retrievals = 0;
+    let snippets = "";
+    const preDeep = input.forceDeep === true ? "显式重试，执行深度核验" : needsDeepCheck(state, invalidation);
+
+    const runTier = async (tier: "L1" | "L2", escalation?: string): Promise<JudgeResult> => {
+      if (tier === "L2") {
+        const queries: Array<{ path?: string; keyword?: string }> = [];
+        for (const criterion of state?.criteria || []) {
+          if (!["stale", "pending", "conflict"].includes(criterion.status)) continue;
+          const file = criterion.evidence.find(ref => ref.kind === "file" && ref.path)?.path;
+          queries.push(file ? { path: file } : { keyword: criterion.criterion.slice(0, 24) });
+        }
+        const hits = queries.slice(0, 4).flatMap(query => searchEvidence(roots.index, sessionMeta.id, { ...query, limit: 2 }));
+        retrievals = hits.length;
+        snippets = hits.map(hit => `- ${hit.tool || "tool"} ${hit.path || ""}（第 ${hit.round} 轮）：${hit.excerpt.slice(0, 420)}`).join("\n");
+      }
+      const result = await runJudge(incrementalPrompt({ contract, state, tier, stale: staleIds, snippets, report, round,
+        escalation: escalationAgentName, stagnantRounds: state?.stagnantRounds, recentNextSteps: state?.recentNextSteps }),
+        profile, ctx.cwd, tier === "L2" && profile.enforceReadTools === true, undefined, signal,
+        { ...judgeContext(kind), fullLogging: true });
+      for (const attempt of result.attempts || []) {
+        attempt.tier = tier;
+        attempt.reusedEvidence = reused;
+        attempt.reverifiedEvidence = invalidation.stale.length;
+        attempt.retrievals = retrievals;
+        attempt.escalation = escalation;
+      }
+      return result;
+    };
+
+    const beforeTip = tip;
+    const unchanged = () => {
+      try {
+        return (ctx.sessionManager.getBranch() as Array<{ id?: string }>).at(-1)?.id === beforeTip;
+      } catch { return true; }
+    };
+
+    let result: JudgeResult;
+    let tier: "L1" | "L2" = preDeep ? "L2" : "L1";
+    if (preDeep) {
+      result = await runTier("L2", preDeep);
+    } else {
+      result = await runTier("L1");
+      const claimed = result.ok && wouldComplete(result.json as Verdict, contract);
+      if (claimed) {
+        // Never accept a completion claim from the cheap path.
+        const deep = await runTier("L2", "L1 声称完成，升级深度核验");
+        const usage = emptyUsage();
+        if (result.usage) addUsage(usage, result.usage);
+        if (deep.usage) addUsage(usage, deep.usage);
+        result = { ...deep, ms: result.ms + deep.ms, usage: usage.turns ? usage : undefined,
+          attempts: [...result.attempts || [], ...deep.attempts || []] };
+        tier = "L2";
+      }
+    }
+
+    if (!unchanged()) return { tier, result, state, invalidation, changed: true, reused, reverified: invalidation.stale.length, retrievals };
+    if (!result.ok || !result.json) return { tier, result, state, invalidation, reused, reverified: invalidation.stale.length, retrievals };
+
+    const next = applyVerdict(state, { sessionId: sessionMeta.id, branchTip: beforeTip, contractKey, round,
+      criteria: contract.completion_criteria, verdict: result.json as Verdict, report, cwd: ctx.cwd, repo });
+    writeState(roots.state, next);
+    for (const attempt of result.attempts || []) if (attempt.logDir) indexAttempt(roots.index, sessionMeta.id, round, attempt.logDir);
+    log({ event: "judge-path", tier, reused, reverified: invalidation.stale.length, retrievals,
+      escalation: input.forceDeep ? "force" : preDeep || undefined });
+    return { tier, result, state: next, invalidation, reused, reverified: invalidation.stale.length, retrievals };
+  }
+
+  function judgeDiagnosisText(profile?: Profile, cwd?: string): string {
     if (!lastJudge) {
       const old = readSessionHistory(logCtx.logFile, sessionMeta.id, 200).filter(entry => entry.event === "judge-usage").at(-1);
       if (!old) return "Supervisor：本 session 尚无判官诊断记录；/supervisor retry 可对有效任务全量留档核验。";
@@ -842,6 +1085,7 @@ export default function (pi: ExtensionAPI) {
     const rows = lastJudge.attempts.map((attempt, index) => [
       `${index + 1}. ${attempt.model} · ${attempt.ok ? "成功" : attempt.errorKind || "失败"} · ${attempt.ms}ms`,
       `   调用 ${attempt.callId} / 尝试 ${attempt.attemptId}`,
+      attempt.tier ? `   路径 ${attempt.tier}${attempt.escalation ? `（${attempt.escalation}）` : ""} · 复用 ${attempt.reusedEvidence ?? 0} 条 · 重验 ${attempt.reverifiedEvidence ?? 0} 条 · 检索 ${attempt.retrievals ?? 0} 次` : "",
       `   输出 ${attempt.stdoutBytes}B / stderr ${attempt.stderrBytes}B；最后事件 ${attempt.lastEvent || "无"}${attempt.lastTool ? ` / 工具 ${attempt.lastTool}` : ""}`,
       attempt.error ? `   ${truncateMiddle(attempt.error, 500)}` : "",
       attempt.logDir ? `   ${attempt.logComplete ? "全量日志" : "日志留档未完成"}：${attempt.logDir}`
@@ -849,7 +1093,8 @@ export default function (pi: ExtensionAPI) {
       !attempt.ok ? `   ${judgeRecovery(attempt.errorKind)}` : "",
     ].filter(Boolean).join("\n"));
     return [`Supervisor 判官诊断 · ${lastJudge.ok ? "最近调用成功" : "最近调用失败，非目标达成"} · ${lastJudge.at}`,
-      ...rows, "恢复入口：/supervisor retry（只核验，不续跑主 Agent）；确认后 /supervisor resume。"].join("\n");
+      ...rows, profile && cwd ? escalationHint(escalationFor(profile, cwd), profile.escalationAgent) : "",
+      "恢复入口：/supervisor retry（只核验，不续跑主 Agent）；确认后 /supervisor resume。"].join("\n");
   }
 
   function judgeFailureHint(): string {
@@ -926,6 +1171,22 @@ export default function (pi: ExtensionAPI) {
     }
     refreshStatus();
   });
+  // pi-subagents publishes async run boundaries on the shared event bus.
+  pi.events?.on("subagent:async-started", (payload: any) => {
+    if (!payload) return;
+    if (!ownedByThisSession(payload)) return;
+    const id = String(payload.id ?? payload.runId ?? "");
+    const startedAt = Number(payload.startedAt);
+    if (id) runningSubagents.set(id, Number.isFinite(startedAt) && startedAt > 0 ? startedAt : Date.now());
+  });
+  for (const event of ["subagent:async-complete", "subagent:process-terminal", "subagent:foreground-complete"]) {
+    pi.events?.on(event, (payload: any) => {
+      const id = String(payload?.runId ?? payload?.id ?? "");
+      if (id) runningSubagents.delete(id);
+      else if (!payload?.sessionId || payload.sessionId === sessionMeta.id) runningSubagents.clear();
+    });
+  }
+  pi.on("session_shutdown", () => { invalidate(); runningSubagents.clear(); });
   pi.on("session_info_changed", (_event, ctx) => {
     captureSessionMeta(ctx);
   });
@@ -969,8 +1230,11 @@ export default function (pi: ExtensionAPI) {
     openQuestions: string[],
     generation: number,
   ): Promise<{ accepted: boolean; feedback?: string }> {
-    const marker = "===== 修改意见（留空提交=确认；Esc=放弃）=====";
-    const base = [contractSummary(candidate), openQuestions.length ? `待澄清:\n${openQuestions.map(q => `- ${q}`).join("\n")}` : ""].filter(Boolean).join("\n\n");
+    const blocking = openQuestions.length > 0;
+    const marker = blocking
+      ? "===== 对以上待澄清项的答复（填写后重新推断；留空=不确认；Esc=放弃）====="
+      : "===== 修改意见（留空提交=确认；Esc=放弃）=====";
+    const base = [contractSummary(candidate), blocking ? `待澄清（未解决前不会启用监督）:\n${openQuestions.map(q => `- ${q}`).join("\n")}` : ""].filter(Boolean).join("\n\n");
     if (!ctx.hasUI || typeof ctx.ui.editor !== "function") return { accepted: false };
     try {
       const edited = await ctx.ui.editor("确认监督终点", `${base}\n\n${marker}\n`);
@@ -986,7 +1250,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function runBootstrapJudge(profile: Profile, ctx: ExtensionContext, feedback: string, generation: number): Promise<JudgeResult> {
-    const prompt = buildBootstrapPrompt(profile, ctx, feedback);
+    const prompt = buildBootstrapPrompt(profile, ctx, feedback, escalationFor(profile, ctx.cwd).name);
     const signal = operationController.signal;
     const first = await runJudge(prompt, profile, ctx.cwd, true, profile.bootstrapTimeoutMs ?? DEFAULTS.bootstrapTimeoutMs, signal, judgeContext("bootstrap"));
     if (!isCurrent(generation)) return first;
@@ -994,7 +1258,7 @@ export default function (pi: ExtensionAPI) {
     if (first.ok || first.errorKind === "spawn" || first.errorKind === "logging") return first;
     log({ event: "bootstrap-retry-no-tools", error: first.error, detail: first.detail, ms: first.ms });
     const second = await runJudge(`${prompt}\n本次无工具，只根据会话推断；不确定的写入 open_questions。`, profile, ctx.cwd, false,
-      Math.min(profile.judgeTimeoutMs ?? DEFAULTS.judgeTimeoutMs, 180_000), signal, judgeContext("bootstrap-retry", true));
+      Math.min(profile.judgeTimeoutMs ?? DEFAULTS.judgeTimeoutMs, 180_000), signal, judgeContext("bootstrap-retry"));
     if (isCurrent(generation)) recordJudgeUsage("bootstrap-retry", second);
     return second;
   }
@@ -1046,14 +1310,22 @@ export default function (pi: ExtensionAPI) {
           if (!replan) { iterations = 0; judgeFailures = 0; lastVerdict = undefined; }
           lifecycle = "active";
           draftPrevious = undefined;
+          // A confirmed or replanned task starts with a clean structured state.
+          try { clearState(stateRoots(profile, ctx.cwd).state, sessionMeta.id); } catch { /* best effort */ }
           persistContract();
           persistState("contract confirmed");
           log({ event: "contract", auto, contract });
           ctx.ui.notify("Supervisor：终点已确认，开始监督。", "info");
           return contract;
         }
+        if (questions.length > 0 && !answer.feedback) {
+          // Confirming an ambiguous candidate is not consent: it must be resolved first.
+          ctx.ui.notify(truncateMiddle(`Supervisor：终点仍有待澄清项，未启用监督。请在“修改意见/答复”区回答后重试：\n${questions.map(q => `- ${q}`).join("\n")}`, 1200), "warning");
+          log({ event: "contract-needs-clarification", questions });
+          return undefined;
+        }
         if (!answer.feedback) {
-          ctx.ui.notify("Supervisor：已放弃新契约，原状态保持不变。", "info");
+          ctx.ui.notify("Supervisor：未确认新契约，原状态保持不变。", "info");
           return undefined;
         }
         notes.push(answer.feedback);
@@ -1195,7 +1467,7 @@ export default function (pi: ExtensionAPI) {
     return { continue: true, entries: [{ type: "custom_message", customType: "pi-supervisor", display: true,
       content: "[Supervisor] 额度探测：从中断处继续，不要复述本条消息。" }] };
   }
-  function interpretVerdict(raw: Verdict, ctx: ExtensionContext): { verdict: Verdict; replan: boolean } {
+  function interpretVerdict(raw: Verdict, ctx: ExtensionContext, options: { deferHumanPause?: boolean } = {}): { verdict: Verdict; replan: boolean } {
     const checked = evaluateVerdict(contract!, raw);
     lastVerdict = checked.verdict;
     contract = mergeContract(contract!, checked.replan ? undefined : checked.verdict.contract_updates);
@@ -1209,7 +1481,10 @@ export default function (pi: ExtensionAPI) {
       log({ event: "done", verdict: checked.verdict });
       ctx.ui.notify("Supervisor：完成条件均已核验，监督结束。", "info");
     } else if (checked.verdict.human_needed === true) {
-      pauseTask(checked.replan ? "endpoint requires confirmation" : "human needed");
+      if (options.deferHumanPause) {
+        // The caller asks the escalation agent whether this is really human.
+        persistState("human needed (pending escalation)");
+      } else pauseTask(checked.replan ? "endpoint requires confirmation" : "human needed");
       log({ event: "human-needed", verdict: checked.verdict });
       ctx.ui.notify(checked.replan ? "Supervisor：终点或限制变化，已暂停；用 /supervisor replan 重新确认。" : "Supervisor：需要你处理，已暂停；处理后 /supervisor resume。", "warning");
     } else {
@@ -1230,6 +1505,11 @@ export default function (pi: ExtensionAPI) {
     logCtx = { cwd: ctx.cwd, logFile: profile.logFile };
     if (!hasExplicitState && lifecycle === "inactive" && (pi.getFlag("supervise") === true || profile.enabled === true)) {
       if (event.outcome === "aborted" || event.outcome === "error" || ctx.hasPendingMessages() || judging || quotaWaiting) return;
+      pruneSubagents();
+      if (runningSubagents.size > 0) {
+        log({ event: "settle-deferred", reason: "subagent running before contract", runs: [...runningSubagents.keys()] });
+        return;
+      }
       const built = await ensureContract(ctx, profile);
       if (!built || (lifecycle as Lifecycle) !== "active") return;
       return { continue: true, entries: [{ type: "custom_message", customType: "pi-supervisor", display: true,
@@ -1237,6 +1517,11 @@ export default function (pi: ExtensionAPI) {
     }
     if (lifecycle !== "active" || !contract || judging || quotaWaiting) return;
     if (event.outcome === "aborted" || ctx.hasPendingMessages() || event.context?.pendingMessages?.length) return;
+    pruneSubagents();
+    if (runningSubagents.size > 0) {
+      log({ event: "settle-deferred", reason: "subagent running", runs: [...runningSubagents.keys()] });
+      return;
+    }
     const generation = operationGeneration;
     if (event.outcome === "error") return handleQuotaError(ctx, profile, event, generation);
     if (quotaState.attempts > 0) {
@@ -1259,9 +1544,23 @@ export default function (pi: ExtensionAPI) {
     const stopBeat = heartbeat(ctx, "正在核验终点", generation);
     try {
       const last = event.context?.contextMessages?.length ? messageText([...event.context.contextMessages].reverse().find(m => m.role === "assistant")) : lastAssistantText;
-      const result = await runJudge(buildEnforcePrompt(contract, ctx, last || lastAssistantText, iterations + 1, profile.escalationAgent || DEFAULTS.escalationAgent),
-        profile, ctx.cwd, profile.enforceReadTools === true, undefined, signal, judgeContext("enforce"));
+      const outcome = await runTieredJudge({ ctx, profile, contract, report: last || lastAssistantText, round: iterations + 1, signal, kind: "enforce" });
       if (!isCurrent(generation) || lifecycle !== "active") return;
+      if (outcome.changed) {
+        log({ event: "judge-session-changed", tier: outcome.tier });
+        persistState("session changed during judge");
+        return { continue: true, entries: [{ type: "custom_message", customType: "pi-supervisor", display: true,
+          content: buildContinuation({ iteration: iterations + 1, reason: "判定期间会话已变化，本轮结论作废", nextStep: contract.next_steps[0] || "核验未完成条件", contract }) }] };
+      }
+      if (outcome.tier === "L0") {
+        iterations += 1;
+        judgeFailures = 0;
+        log({ event: "judge-l0", iteration: iterations, reason: outcome.l0Reason, reused: outcome.reused });
+        persistState("l0 stable unmet");
+        return { continue: true, entries: [{ type: "custom_message", customType: "pi-supervisor", display: true,
+          content: buildContinuation({ iteration: iterations, reason: `结构化状态未变化：${outcome.l0Reason}`, nextStep: contract.next_steps[0] || "核验未完成条件", contract }) }] };
+      }
+      const result = outcome.result!;
       recordJudgeUsage("enforce", result);
       if (!result.ok || !result.json) {
         judgeFailures += 1;
@@ -1276,8 +1575,64 @@ export default function (pi: ExtensionAPI) {
       }
       judgeFailures = 0;
       iterations += 1;
-      const { verdict, replan } = interpretVerdict(result.json as Verdict, ctx);
+      const { verdict, replan } = interpretVerdict(result.json as Verdict, ctx, { deferHumanPause: true });
       log({ event: "verdict", iteration: iterations, verdict, ms: result.ms });
+      const stagnationLimit = profile.stagnationRounds ?? DEFAULTS.stagnationRounds;
+      const stagnant = outcome.state?.stagnantRounds ?? 0;
+      const humanGate = verdict.human_needed === true;
+      const stalled = stagnationLimit > 0 && stagnant >= stagnationLimit && verdict.goal_achieved !== true;
+      if (humanGate || stalled) {
+        // Before honouring a human gate (or pausing for stagnation), ask the
+        // configured escalation agent what is truly blocked on a human.
+        const judged = await adjudicate({ ctx, profile, contract, report: last || lastAssistantText,
+          verdict, round: iterations, signal, state: outcome.state });
+        if (!isCurrent(generation) || lifecycle !== "active") return;
+        const admin = judged.admin;
+        const executable = admin?.executable ?? [];
+        const human = admin?.humanRequired ?? [];
+        if (admin && executable.length > 0 && human.length === 0) {
+          const next = executable[0].action;
+          iterations += 1;
+          try {
+            const state2 = applyVerdict(outcome.state, { sessionId: sessionMeta.id, branchTip: outcome.state?.branchTip,
+              contractKey: judgeContractKey(contract), round: iterations, criteria: contract.completion_criteria,
+              verdict: { goal_achieved: false, human_needed: false, reason: `escalation：${admin.reason || "仍有可执行工作"}`,
+                next_step: next, unmet_conditions: executable.map(item => item.action) } as Verdict,
+              report: `escalation:${admin.reason || ""}`, cwd: ctx.cwd, escalationIncrement: 1, repo: snapshotRepo(ctx.cwd) });
+            writeState(stateRoots(profile, ctx.cwd).state, state2);
+          } catch { /* state stays as-is; next round re-derives */ }
+          judgeFailures = 0;
+          log({ event: "escalation-override", human: human.length, executable: executable.length, nextStep: next });
+          persistState("escalation: executable work remains");
+          return { continue: true, entries: [{ type: "custom_message", customType: "pi-supervisor", display: true,
+            content: buildContinuation({ iteration: iterations, reason: `升级诊断：仍需执行（${admin.reason || "存在可执行动作"}）`,
+              nextStep: next, contract: contract!, unmet: executable.map(item => item.action) }) }] };
+        }
+        if (admin && human.length > 0) {
+          log({ event: "escalation-human-gate", items: human.map(item => item.item).slice(0, 6), reason: admin.reason ?? null });
+          pauseTask("escalation human gate");
+          return stopBoundary(`[Supervisor] 已暂停：升级诊断确认以下阻断需要人类处理，非目标达成。\n` +
+            human.slice(0, 6).map(item => `- ${item.item}${item.why ? `：${item.why}` : ""}`).join("\n") +
+            (executable.length ? `\n另有可执行项（恢复后优先）：\n${executable.slice(0, 4).map(item => `- ${item.action}`).join("\n")}` : "") +
+            "\n处理后 /supervisor resume。");
+        }
+        if (stalled) {
+          const recent = (outcome.state?.recentNextSteps || []).slice(-2).reverse();
+          log({ event: "judge-stagnation", rounds: stagnant, nextSteps: recent, escalation: judged.ok ? "no-adjudication" : judged.error ?? null });
+          pauseTask("judge stagnation");
+          return stopBoundary(`[Supervisor] 已暂停：连续 ${stagnant} 轮无新增证据，非目标达成。\n` +
+            `最近建议：${recent.map(step => `\n- ${truncateMiddle(step, 160)}`).join("") || "(无)"}\n` +
+            (judged.skipped ? `升级诊断不可用：${judged.error}。\n` : "升级诊断未给出可用结论。\n") +
+            "若剩余阻断需要人类批准或授权，请处理后 /supervisor resume；若要继续核验，请先补充新的证据或改变核验方式。");
+        }
+        // No usable adjudication: honour the original human boundary.
+        if (humanGate) {
+          pauseTask(replan ? "endpoint requires confirmation" : "human needed");
+          log({ event: "human-needed", verdict, escalation: judged.skipped ? "unavailable" : "no-verdict" });
+          ctx.ui.notify(replan ? "Supervisor：终点或限制变化，已暂停；用 /supervisor replan 重新确认。" : "Supervisor：需要你处理，已暂停；处理后 /supervisor resume。", "warning");
+          return verdictStop(verdict, replan);
+        }
+      }
       if (verdict.goal_achieved === true || verdict.human_needed === true) return verdictStop(verdict, replan);
       const continuation = buildContinuation({ iteration: iterations, reason: verdict.reason || "终点尚未验证",
         nextStep: verdict.next_step || contract!.next_steps[0] || "核验未完成的完成条件", contract: contract!,
@@ -1341,8 +1696,24 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (sub === "resume") {
-        if (lifecycle !== "paused" || !contract) {
-          ctx.ui.notify("Supervisor：没有可恢复的暂停任务；/supervisor start 建立新任务。", "warning");
+        if (lifecycle === "active") {
+          ctx.ui.notify("Supervisor：监督正在进行，无需 resume。要重新核验用 /supervisor retry；要停下用 /supervisor pause。", "info");
+          return;
+        }
+        if (lifecycle === "drafting") {
+          ctx.ui.notify("Supervisor：终点尚待确认，无需 resume；完成确认或 /supervisor cancel 放弃。", "info");
+          return;
+        }
+        if (lifecycle === "completed" || lifecycle === "cancelled") {
+          ctx.ui.notify(`Supervisor：任务${stateLabel()}，无法恢复；用 /supervisor start 建立新任务。`, "info");
+          return;
+        }
+        if (lifecycle === "paused" && !contract) {
+          ctx.ui.notify("Supervisor：暂停任务缺少有效契约，无法恢复；请用 /supervisor start 重建终点。", "warning");
+          return;
+        }
+        if (lifecycle !== "paused") {
+          ctx.ui.notify("Supervisor：当前没有可恢复的暂停任务；/supervisor start 建立新任务。", "info");
           return;
         }
         invalidate();
@@ -1372,6 +1743,7 @@ export default function (pi: ExtensionAPI) {
         draftPrevious = undefined;
         lifecycle = "cancelled";
         contract = undefined;
+        try { clearState(stateRoots(profile, ctx.cwd).state, sessionMeta.id); } catch { /* best effort */ }
         lastVerdict = undefined;
         lastJudge = undefined;
         lastErrorMessage = undefined;
@@ -1426,9 +1798,15 @@ export default function (pi: ExtensionAPI) {
         const retry = sub === "retry";
         const stopBeat = heartbeat(ctx, retry ? "正在重试判官（全量日志）" : "正在手动核验", generation);
         try {
-          const result = await runJudge(buildEnforcePrompt(contract, ctx, lastAssistantText, iterations + 1, profile.escalationAgent || DEFAULTS.escalationAgent),
-            profile, ctx.cwd, profile.enforceReadTools === true, undefined, signal, judgeContext(retry ? "manual-retry" : "manual", retry));
+          const outcome = await runTieredJudge({ ctx, profile, contract, report: lastAssistantText, round: iterations + 1, signal,
+            kind: retry ? "manual-retry" : "manual", allowL0: false, forceDeep: retry });
           if (!isCurrent(generation) || !contract || (lifecycle !== "active" && lifecycle !== "paused")) return;
+          if (outcome.changed) {
+            log({ event: "judge-session-changed", tier: outcome.tier });
+            ctx.ui.notify("Supervisor：判定期间会话已变化，本轮结果作废；按状态再试。", "warning");
+            return;
+          }
+          const result = outcome.result!;
           recordJudgeUsage(retry ? "manual-retry" : "manual", result);
           if (!result.ok || !result.json) {
             if (retry) judgeFailures += 1;
@@ -1453,7 +1831,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (sub === "diagnose") {
-        ctx.ui.notify(judgeDiagnosisText(), lastJudge?.ok === false ? "warning" : "info");
+        ctx.ui.notify(judgeDiagnosisText(profile, ctx.cwd), lastJudge?.ok === false ? "warning" : "info");
         return;
       }
       if (sub === "quota") {
@@ -1504,7 +1882,8 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (sub === "details") {
-        ctx.ui.notify(contract ? contractSummary(contract, true) : `Supervisor：${stateLabel()}，没有有效契约。`, "info");
+        const escalationLine = escalationHint(escalationFor(profile, ctx.cwd), profile.escalationAgent);
+        ctx.ui.notify([contract ? contractSummary(contract, true) : `Supervisor：${stateLabel()}，没有有效契约。`, escalationLine].join("\n\n"), "info");
         return;
       }
       if (sub !== "status") {

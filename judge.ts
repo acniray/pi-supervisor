@@ -35,7 +35,7 @@ export function addUsage(target: UsageSummary, usage: unknown): void {
   target.turns += typeof u.turns === "number" ? num(u.turns) : 1;
 }
 
-export type JudgeErrorKind = "spawn" | "timeout" | "exit" | "provider" | "parse" | "incomplete" | "logging" | "invalidated";
+export type JudgeErrorKind = "spawn" | "timeout" | "exit" | "provider" | "parse" | "incomplete" | "logging" | "session" | "extension" | "invalidated";
 
 export interface JudgeAttempt {
   callId: string;
@@ -45,8 +45,13 @@ export interface JudgeAttempt {
   logComplete: boolean;
   logDir?: string;
   parentSessionId?: string;
-  judgeSessionId?: string;
   kind?: string;
+  /** Judgement tier chosen by the caller; L0 never spawns a process. */
+  tier?: "L0" | "L1" | "L2";
+  reusedEvidence?: number;
+  reverifiedEvidence?: number;
+  retrievals?: number;
+  escalation?: string;
   ok: boolean;
   errorKind?: JudgeErrorKind;
   error?: string;
@@ -94,6 +99,30 @@ export interface RunJudgeOnceOptions extends JudgeRunContext {
   signal?: AbortSignal;
   callId?: string;
   logRoot?: string;
+  /** Explicit provider extension paths; `--no-extensions` still blocks every other extension. */
+  extensionPaths?: string[];
+}
+
+const NPM_PACKAGE = /^(?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*$/i;
+
+/**
+ * Resolve one explicitly allowed judge extension. Judge subprocesses keep
+ * --no-extensions, so only configured provider packages can register models.
+ */
+export function resolveJudgeExtension(spec: string, cwd: string, agentDir: string): string {
+  const value = spec.trim();
+  if (!value) throw new Error("判官扩展配置为空");
+  if (value.startsWith("builtin:")) throw new Error(`判官不接受 builtin 扩展：${value}`);
+  if (value.startsWith("npm:")) {
+    const name = value.slice(4);
+    if (!NPM_PACKAGE.test(name)) throw new Error(`判官 npm 扩展包名无效：${name}`);
+    const pkgDir = path.join(agentDir, "npm", "node_modules", name);
+    if (!fs.existsSync(path.join(pkgDir, "package.json"))) throw new Error(`判官找不到 npm 扩展：${name}（${pkgDir}）`);
+    return pkgDir;
+  }
+  const resolved = path.resolve(cwd, value);
+  if (!fs.existsSync(resolved)) throw new Error(`判官扩展路径不存在：${resolved}`);
+  return resolved;
 }
 
 interface JudgeOutput {
@@ -244,7 +273,6 @@ interface FullLog {
   dir: string;
   sessionId: string;
   stdout: number;
-  stderr: number;
 }
 
 function privateFile(file: string, content: string): void {
@@ -257,23 +285,18 @@ function openFullLog(options: RunJudgeOnceOptions, callId: string, attemptId: st
   const dir = path.join(root, `${new Date().toISOString().replace(/[:.]/g, "-")}-${attemptId}`);
   fs.mkdirSync(dir, { mode: 0o700 });
   const sessionId = randomUUID();
-  let stdout: number | undefined, stderr: number | undefined;
+  let stdout: number | undefined;
   try {
     privateFile(path.join(dir, "request.json"), JSON.stringify({
       callId, attemptId, parentSessionId: options.parentSessionId, parentSessionFile: options.parentSessionFile,
-      parentSessionName: options.parentSessionName, kind: options.kind, judgeSessionId: sessionId,
+      parentSessionName: options.parentSessionName, kind: options.kind,
       model: options.model, thinking: options.thinking, cwd: options.cwd,
       withTools: options.withTools, timeoutMs: options.timeoutMs, prompt: options.prompt,
     }, null, 2) + "\n");
-    // Pre-create a valid, private native session so append-mode preserves 0600.
-    privateFile(path.join(dir, "session.jsonl"), JSON.stringify({ type: "session", version: 3, id: sessionId,
-      timestamp: new Date().toISOString(), cwd: options.cwd }) + "\n");
     stdout = fs.openSync(path.join(dir, "stdout.jsonl"), "wx", 0o600);
-    stderr = fs.openSync(path.join(dir, "stderr.log"), "wx", 0o600);
-    return { dir, sessionId, stdout, stderr };
+    return { dir, sessionId, stdout };
   } catch (error) {
     if (stdout !== undefined) fs.closeSync(stdout);
-    if (stderr !== undefined) fs.closeSync(stderr);
     throw error;
   }
 }
@@ -310,15 +333,13 @@ export async function runJudgeOnce(options: RunJudgeOnceOptions): Promise<JudgeR
     const result: JudgeResult = { ok: !failure, ...(failure ? { error: failure.error, errorKind: failure.kind } : { json }),
       text: output.text, usage: output.usage, detail: output.detail, raw: raw.slice(-4000), stderr: stderr.slice(-2000), model, ms };
     const attempt: JudgeAttempt = { callId, attemptId, model, kind: options.kind, fullLogging: options.fullLogging === true,
-      logComplete: false, parentSessionId: options.parentSessionId, logDir: fullLog?.dir, judgeSessionId: fullLog?.sessionId,
+      logComplete: false, parentSessionId: options.parentSessionId, logDir: fullLog?.dir,
       ok: result.ok, error: result.error, errorKind: result.errorKind, detail: output.detail,
       ms, usage: output.usage, stdoutBytes, stderrBytes, lastEvent: output.lastEvent, lastTool: output.lastTool };
     result.attempts = [attempt];
     if (fullLog) {
       try {
         fs.closeSync(fullLog.stdout); fullLog.stdout = -1;
-        fs.closeSync(fullLog.stderr); fullLog.stderr = -1;
-        privateFile(path.join(fullLog.dir, "text.txt"), output.text);
         attempt.logComplete = result.errorKind !== "logging";
         privateFile(path.join(fullLog.dir, "result.json"), JSON.stringify({ ...result, exitCode: code, signal: closeSignal || null }, null, 2) + "\n");
       } catch (error) {
@@ -327,7 +348,7 @@ export async function runJudgeOnce(options: RunJudgeOnceOptions): Promise<JudgeR
         result.error = attempt.error = `judge 全量日志写入失败：${String(error)}；目录 ${fullLog.dir}`;
         delete result.json;
       } finally {
-        for (const fd of [fullLog.stdout, fullLog.stderr]) if (fd >= 0) { try { fs.closeSync(fd); } catch { /* already closed */ } }
+        if (fullLog.stdout >= 0) { try { fs.closeSync(fullLog.stdout); } catch { /* already closed */ } }
       }
     }
     return result;
@@ -345,7 +366,9 @@ export async function runJudgeOnce(options: RunJudgeOnceOptions): Promise<JudgeR
       return finish(null);
     }
   }
-  const args = ["--mode", "json", ...(fullLog ? ["--session", path.join(fullLog.dir, "session.jsonl")] : ["--no-session"]),
+  const extensionArgs = (options.extensionPaths || []).flatMap(entry => ["--extension", entry]);
+  // Every round is an independent session: history lives in stdout logs + index.
+  const args = ["--mode", "json", ...extensionArgs, "--no-session",
     "--no-extensions", "--no-skills", "--no-context-files",
     ...(withTools ? ["--tools", "read,grep,find,ls"] : ["--no-tools"]),
     "--model", model, "--thinking", thinking, prompt];
@@ -375,10 +398,6 @@ export async function runJudgeOnce(options: RunJudgeOnceOptions): Promise<JudgeR
     child.stderr?.on("data", (chunk: Buffer) => {
       stderrBytes += chunk.length;
       stderr = (stderr + chunk.toString()).slice(-4000);
-      if (fullLog && fullLog.stderr >= 0) {
-        try { writeAll(fullLog.stderr, chunk); }
-        catch (error) { stop("logging", `judge 全量 stderr 写入失败：${String(error)}；目录 ${fullLog.dir}`); }
-      }
     });
     child.on("error", (error) => { if (!failure) failure = { kind: "spawn", error: `judge 进程启动失败：${String(error)}` }; });
     child.on("close", (code, closeSignal) => {
