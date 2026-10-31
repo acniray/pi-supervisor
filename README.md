@@ -148,7 +148,6 @@ touch ~/.pi/agent/extensions/pi-supervisor/STOP
       "judgeStateDir": "~/.pi/agent/extensions/pi-supervisor/state",
       "judgeIndexDir": "~/.pi/agent/extensions/pi-supervisor/evidence-index",
       "judgeExtensions": [],           // 例如 ["npm:pi-provider-qoder"]，只给判官加载指定 provider
-      "goal": null,                  // 可选的固定目标提示，仍需形成明确终点
       "quotaWait": {
         "enabled": true,
         "intervalMs": 600000,        // 默认 10 分钟，下限 5s，上限 24h
@@ -188,6 +187,14 @@ touch ~/.pi/agent/extensions/pi-supervisor/STOP
 正常核验失败不等于完成：未到连续失败上限时按现有契约继续核验，达到上限则暂停。手动 `judge` 失败不改变启停状态；显式 `retry` 失败会计入连续失败次数，并遵守原暂停上限。有效判定成功后清零连续失败次数，不能据此认定目标完成。
 
 JSONL 按 LF 增量解析并正确处理跨块 UTF-8；最终判定与诊断尾缓存分离，不会再被大量工具输出或最后的 `agent_end` 消息汇总挤掉。只有完成的最终 assistant 消息可进入现有证据闸门；`toolUse`、中断、provider 错误和未完成流中的 JSON 不能冒充最终判定。每个协议记录的解析上限为 4,000,000 个 UTF-16 码元（含边界值），超大记录丢弃至下个 LF，不把残片重新当 JSON；全量原始日志不受该解析上限截断。
+
+### 目标不属于配置
+
+`goal` 字段**已弃用**：Supervisor 不再把配置里的目标注入推断提示词。原因是一个路径下的所有会话会共享同一段文本，无法表达“一个项目多个目标”，而且很容易过时（例如写死了早已被取代的候选 SHA）。
+
+- 目标的权威来源是**用户确认过的契约**（session 级，随分支保存、可 `replan`）；
+- 同一路径下多个目标 = 多个监督任务（各自 `start`），或 `replan` 切换；
+- 如果配置里仍留着 `goal`，只会在审计日志记一条 `goal-ignored`，不参与判定。
 
 ### escalationAgent：真实的升级裁决
 

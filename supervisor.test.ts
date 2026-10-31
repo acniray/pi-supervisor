@@ -966,3 +966,15 @@ test("stagnation consults escalation before pausing and continues on executable 
   assert.equal(h.state.lifecycle, "active");
   assert.match(JSON.stringify(result), /补齐 89 项候选适用性登记/);
 });
+
+test("a configured goal is no longer injected into contract inference", async () => {
+  const h = await harness({ profile: { goal: "旧目标：优先 2a051f2f 的 #31" } });
+  h.editor = (prefill: string) => prefill;
+  h.enqueue(candidate());
+  await h.command("start");
+  const prompt = h.promptOf(h.audit().find((row: any) => row.kind === "bootstrap").logDir);
+  assert.doesNotMatch(prompt, /2a051f2f/);
+  assert.doesNotMatch(prompt, /用户固定目标/);
+  assert.ok(h.audit().some((row: any) => row.event === "goal-ignored"));
+  assert.equal(h.contract?.mission, baseContract.mission, "the confirmed contract still governs");
+});

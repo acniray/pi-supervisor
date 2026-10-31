@@ -119,7 +119,10 @@ interface Profile {
   logFile?: string;
   /** Wait out a main-agent allowance outage instead of settling. */
   quotaWait?: QuotaWaitConfig;
-  /** Optional fixed goal; used as a strong hint during bootstrap. */
+  /**
+   * Deprecated and no longer injected. The goal belongs to the confirmed
+   * contract (per session), not to a path-scoped config entry.
+   */
   goal?: string;
 }
 
@@ -678,7 +681,6 @@ function buildBootstrapPrompt(profile: Profile, ctx: ExtensionContext, feedback:
 只从会话确定任务范围；不要混入同一仓库内其他 session 的任务。
 仓库只用于核对会话明确提及的关键事实；只读工具最多建议 8 次，不扫描目录或默认读取计划。
 信息不足时提出具体 open_questions，不要编造目标、文件、规则或授权。
-${profile.goal?.trim() ? `用户固定目标：${profile.goal.trim()}` : ""}
 ${feedback ? `用户对上次候选的修改要求（必须满足）：\n${feedback}` : ""}
 ${escalation ? `已配置的可用升级诊断 agent：${escalation}；仅在会话或必要决策规则要求时采用，不强制每个任务调用。` : ""}
 
@@ -1250,6 +1252,10 @@ ${definition.body.slice(0, 4000)}`;
   }
 
   async function runBootstrapJudge(profile: Profile, ctx: ExtensionContext, feedback: string, generation: number): Promise<JudgeResult> {
+    if (profile.goal?.trim()) {
+      log({ event: "goal-ignored", reason: "configured goal is deprecated; the confirmed contract governs",
+        configured: profile.goal.trim().slice(0, 160) });
+    }
     const prompt = buildBootstrapPrompt(profile, ctx, feedback, escalationFor(profile, ctx.cwd).name);
     const signal = operationController.signal;
     const first = await runJudge(prompt, profile, ctx.cwd, true, profile.bootstrapTimeoutMs ?? DEFAULTS.bootstrapTimeoutMs, signal, judgeContext("bootstrap"));
