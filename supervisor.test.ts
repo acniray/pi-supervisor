@@ -108,7 +108,8 @@ async function harness(options: any = {}) {
     abort: () => { aborts += 1; }, compact: (value: any) => { compactOptions = value; },
     sessionManager: {
       getEntries: () => entries, getBranch: () => entries,
-      getSessionId: () => sessionId, getSessionName: () => sessionId, getSessionFile: () => undefined,
+      getSessionId: () => sessionId, getSessionName: () => sessionId,
+      getSessionFile: () => path.join(cwd, `${sessionId}.jsonl`),
       buildSessionProjection: () => ({ messages: [{ role: "user", content: "实现可靠的取消功能" }] }),
     },
     ui: {
@@ -977,4 +978,37 @@ test("a configured goal is no longer injected into contract inference", async ()
   assert.doesNotMatch(prompt, /用户固定目标/);
   assert.ok(h.audit().some((row: any) => row.event === "goal-ignored"));
   assert.equal(h.contract?.mission, baseContract.mission, "the confirmed contract still governs");
+});
+
+function writeAsyncRun(sessionFile: string, state: string, startedAt: number): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-uid0-"));
+  const run = path.join(dir, "async-subagent-runs", "run-1");
+  fs.mkdirSync(run, { recursive: true });
+  fs.writeFileSync(path.join(run, "status.json"), JSON.stringify({ state, runId: "run-1", sessionId: sessionFile, startedAt }));
+  return dir;
+}
+
+test("a running child is detected from its status.json even without events", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  const sessionFile = path.join(h.cwd, `${path.basename(h.cwd)}.jsonl`);
+  fs.writeFileSync(sessionFile, "{}\n");
+  const tmp = writeAsyncRun(sessionFile, "running", Date.now());
+  try {
+    h.enqueue({ goal_achieved: false }); await h.settle();
+    assert.equal(h.callCount(), 0, "no judgement while a child of this session runs");
+    assert.ok(h.audit().some(row => row.event === "settle-deferred"));
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test("finished, foreign and stale runs do not block judgement", async () => {
+  const h = await harness({ entries: [contractEntry(), stateEntry("active")] });
+  const sessionFile = path.join(h.cwd, `${path.basename(h.cwd)}.jsonl`);
+  fs.writeFileSync(sessionFile, "{}\n");
+  const done = writeAsyncRun(sessionFile, "complete", Date.now());
+  const foreign = writeAsyncRun("/elsewhere/other-session.jsonl", "running", Date.now());
+  const stale = writeAsyncRun(sessionFile, "running", Date.now() - 5 * 60 * 60 * 1000);
+  try {
+    h.enqueue({ goal_achieved: false }); await h.settle();
+    assert.equal(h.callCount(), 1);
+  } finally { for (const dir of [done, foreign, stale]) fs.rmSync(dir, { recursive: true, force: true }); }
 });

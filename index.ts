@@ -762,10 +762,53 @@ export default function (pi: ExtensionAPI) {
   }
   function ownedByThisSession(payload: any): boolean {
     const owner = payload?.sessionId ?? payload?.parentSessionId;
-    return !owner || owner === sessionMeta.id;
+    if (!owner) return true;
+    const text = String(owner);
+    return text === sessionMeta.id || text === sessionMeta.path ||
+      (Boolean(sessionMeta.file) && (text === sessionMeta.file || text.endsWith(`/${sessionMeta.file}`)));
+  }
+
+  /**
+   * pi-subagents keeps one status.json per async run. Its sessionId is the full
+   * session path, and events can be missed (workflow runs, reload, older
+   * versions), so this filesystem check is the authoritative gate.
+   */
+  function runningChildRuns(): string[] {
+    const roots: string[] = [];
+    try {
+      for (const entry of fs.readdirSync(os.tmpdir(), { withFileTypes: true })) {
+        if (!entry.isDirectory() || !entry.name.startsWith("pi-subagents-")) continue;
+        roots.push(path.join(os.tmpdir(), entry.name, "async-subagent-runs"));
+      }
+    } catch { return []; }
+    const running: string[] = [];
+    const now = Date.now();
+    for (const root of roots) {
+      let dirs: string[];
+      try { dirs = fs.readdirSync(root); } catch { continue; }
+      // History holds thousands of finished runs; only recently touched ones can be live.
+      const recent = dirs.flatMap(dir => {
+        try {
+          const mtime = fs.statSync(path.join(root, dir)).mtimeMs;
+          return mtime > now - SUBAGENT_STALE_MS ? [{ dir, mtime }] : [];
+        } catch { return []; }
+      }).sort((a, b) => b.mtime - a.mtime).slice(0, 50);
+      for (const { dir } of recent) {
+        const file = path.join(root, dir, "status.json");
+        let status: any;
+        try { status = JSON.parse(fs.readFileSync(file, "utf8")); } catch { continue; }
+        const state = String(status?.state ?? status?.status ?? "");
+        if (state !== "running" && state !== "starting" && state !== "pending") continue;
+        if (!ownedByThisSession(status)) continue;
+        const startedAt = Number(status?.startedAt) || now;
+        if (now - startedAt > SUBAGENT_STALE_MS) continue;
+        running.push(String(status?.runId ?? dir));
+      }
+    }
+    return running;
   }
   let judging = false;
-  let sessionMeta = { id: "", name: "", file: "" };
+  let sessionMeta = { id: "", name: "", file: "", path: "" };
   let logCtx: { cwd: string; logFile?: string } = { cwd: process.cwd() };
   const usageTotals = emptyUsage();
 
@@ -813,6 +856,7 @@ export default function (pi: ExtensionAPI) {
         id: ctx.sessionManager.getSessionId() || "",
         name: ctx.sessionManager.getSessionName() || "",
         file: file ? path.basename(file) : "",
+        path: file || "",
       };
     } catch {
       // best effort; session association is nice-to-have
@@ -1131,7 +1175,7 @@ ${definition.body.slice(0, 4000)}`;
     judgeFailures = 0;
     resetQuotaState();
     Object.assign(usageTotals, emptyUsage());
-    sessionMeta = { id: "", name: "", file: "" };
+    sessionMeta = { id: "", name: "", file: "", path: "" };
     captureSessionMeta(ctx);
     logCtx = { cwd: ctx.cwd, logFile: resolveProfile(ctx.cwd).logFile };
     try {
@@ -1512,8 +1556,9 @@ ${definition.body.slice(0, 4000)}`;
     if (!hasExplicitState && lifecycle === "inactive" && (pi.getFlag("supervise") === true || profile.enabled === true)) {
       if (event.outcome === "aborted" || event.outcome === "error" || ctx.hasPendingMessages() || judging || quotaWaiting) return;
       pruneSubagents();
-      if (runningSubagents.size > 0) {
-        log({ event: "settle-deferred", reason: "subagent running before contract", runs: [...runningSubagents.keys()] });
+      const childRuns = [...new Set([...runningSubagents.keys(), ...runningChildRuns()])];
+      if (childRuns.length > 0) {
+        log({ event: "settle-deferred", reason: "subagent running before contract", runs: childRuns });
         return;
       }
       const built = await ensureContract(ctx, profile);
@@ -1524,8 +1569,9 @@ ${definition.body.slice(0, 4000)}`;
     if (lifecycle !== "active" || !contract || judging || quotaWaiting) return;
     if (event.outcome === "aborted" || ctx.hasPendingMessages() || event.context?.pendingMessages?.length) return;
     pruneSubagents();
-    if (runningSubagents.size > 0) {
-      log({ event: "settle-deferred", reason: "subagent running", runs: [...runningSubagents.keys()] });
+    const childRuns = [...new Set([...runningSubagents.keys(), ...runningChildRuns()])];
+    if (childRuns.length > 0) {
+      log({ event: "settle-deferred", reason: "subagent running", runs: childRuns });
       return;
     }
     const generation = operationGeneration;
